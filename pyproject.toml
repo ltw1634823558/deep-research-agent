@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "deep-research-agent"
+version = "1.1.0"
+description = "生产级深度研究多智能体：LangGraph 编排 + Obsidian 私域知识 + 混合检索"
+requires-python = ">=3.10"
+
+# ---- Ruff：团队统一 lint/格式化门禁 ----
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+# E=pycodestyle, F=pyflakes, I=isort, UP=pyupgrade, SIM=simplify, B=bugbear
+select = ["E", "F", "I", "UP", "SIM", "B"]
+ignore = ["E501", "B008", "SIM105"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+# ---- Mypy：静态类型检查门禁 ----
+[tool.mypy]
+python_version = "3.13"
+ignore_missing_imports = true
+warn_unused_ignores = false
+disallow_untyped_defs = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

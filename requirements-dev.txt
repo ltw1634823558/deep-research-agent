@@ -1,0 +1,5 @@
+# 开发期依赖：质量门禁与测试
+# 安装：pip install -r requirements-dev.txt
+ruff>=0.6.0        # lint + 格式化（门禁）
+mypy>=1.10.0       # 静态类型检查（门禁）
+pytest>=8.0.0      # 测试运行器

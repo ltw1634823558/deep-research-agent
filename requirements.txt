@@ -1,0 +1,14 @@
+langgraph>=0.2.0
+langchain>=0.3.0
+langchain-openai>=0.2.0
+langchain-community>=0.3.0
+tavily-python>=0.3.0
+fastmcp>=3.0.0
+mcp>=1.9.0
+fastapi>=0.110.0
+uvicorn>=0.29.0
+langfuse>=2.0.0
+chromadb>=0.5.0
+pydantic>=2.7.0
+python-dotenv>=1.0.0
+requests>=2.31.0

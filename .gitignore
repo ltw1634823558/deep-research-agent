@@ -1,0 +1,30 @@
+# ===== Secrets (NEVER commit) =====
+.env
+.env.*
+!.env.example
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.envrc
+
+# ===== Tooling caches =====
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ===== Runtime / data artifacts =====
+.memory_store/
+memory.db
+*.db
+.dotenv_quote_test.tmp
+
+# ===== Editor / OS =====
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
