@@ -31,7 +31,7 @@ from .graph import build_graph
 from .jobs import STAGES, JobStatus, _to_sources, _to_subtopics, store
 from .memory import memory_store
 from .observability import get_callbacks
-from .state import ResearchState, initial_state
+from .state import ResearchState, _add_sources, initial_state
 
 app = FastAPI(title="Deep Research Agent API", version="1.0.0")
 graph = build_graph()
@@ -168,7 +168,9 @@ def _run_job(job_id: str, query: str, mode: str, cfg: Settings) -> None:
                     cur_plan = patch["plan"]
                     store.update(job_id, subtopics=_to_subtopics(cur_plan))
                 if "sources" in patch:
-                    cur_sources = cur_sources + list(patch["sources"])
+                    # 必须复用 state 的 _add_sources reducer：直接 + 拼接会绕过按 URL 去重，
+                    # 导致 dashboard 来源重复膨胀、评估分母失真。
+                    cur_sources = _add_sources(cur_sources, list(patch["sources"]))
                     store.update(job_id, sources=_to_sources(cur_sources))
                 if "memory_recall" in patch:
                     cur_memory_recall = cur_memory_recall + list(patch["memory_recall"])
@@ -251,20 +253,21 @@ def research_job(req: ResearchRequest, cfg: Settings = Depends(get_settings)):
 @app.get("/api/jobs")
 def list_jobs():
     # 轻量 DTO：dashboard 高频轮询，不回传 report/analysis/sources 等大字段。
+    # 序列化在 store 内部持锁完成（list_snapshots），避免后台线程写入时的撕裂读。
     return [
         {
-            "id": j.id,
-            "query": j.query,
-            "mode": j.mode,
-            "status": j.status,
-            "stage_index": j.stage_index,
-            "progress": j.progress,
-            "created_at": j.created_at,
-            "updated_at": j.updated_at,
-            "error": j.error,
-            "source_count": len(j.sources),
+            "id": j["id"],
+            "query": j["query"],
+            "mode": j["mode"],
+            "status": j["status"],
+            "stage_index": j["stage_index"],
+            "progress": j["progress"],
+            "created_at": j["created_at"],
+            "updated_at": j["updated_at"],
+            "error": j["error"],
+            "source_count": len(j["sources"]),
             "metrics": {
-                k: j.metrics.get(k)
+                k: j["metrics"].get(k)
                 for k in (
                     "task_completion_rate",
                     "citation_accuracy",
@@ -272,10 +275,10 @@ def list_jobs():
                     "citation_recall",
                     "sources_total",
                 )
-                if k in j.metrics
+                if k in j["metrics"]
             },
         }
-        for j in store.list()
+        for j in store.list_snapshots()
     ]
 
 

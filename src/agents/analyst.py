@@ -15,7 +15,6 @@ from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableConfig
 
 from ..config import get_llm, resolve_settings
-from ..observability import callbacks
 from ..state import Finding, ResearchState, Subtopic
 
 # 低置信 / 不确定表述标记（命中即视为分析不可靠，需要修补或补充检索）
@@ -58,14 +57,16 @@ def _critique_analysis(findings: list[Finding], analysis: str) -> tuple[bool, li
 
 def analyst_node(state: ResearchState, config: RunnableConfig) -> dict:
     cfg = resolve_settings(config)
-    llm = get_llm()
+    llm = get_llm(cfg)
     findings_text = "\n".join(f"[{f.subtopic_id}] {f.summary}" for f in state["findings"])
     base_prompt = (
         "你是一个研究核验智能体。请分析以下各子主题的发现，"
         "判断是否一致、是否有明显缺口需要补充检索。\n"
         f"发现：\n{findings_text}"
     )
-    analysis = llm.invoke(base_prompt, config={"callbacks": callbacks}).content
+    # 直接透传节点自身的 RunnableConfig：其中已带本次任务专属的 callbacks，
+    # 不能再用模块级全局 callbacks 覆盖，否则并发任务的 trace 会串到同一个 handler。
+    analysis = llm.invoke(base_prompt, config=config).content
     self_heal = 0
     ok = True  # 最近一次批判结论（mock 模式不批判，视为通过）
 
@@ -81,7 +82,7 @@ def analyst_node(state: ResearchState, config: RunnableConfig) -> dict:
             try:
                 analysis = llm.invoke(
                     base_prompt + "\n\n" + critique,
-                    config={"callbacks": callbacks},
+                    config=config,
                 ).content
             except Exception:
                 break  # 调用失败则保留上一版，不中断管线

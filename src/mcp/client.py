@@ -23,6 +23,23 @@ from mcp import ClientSession
 from ..config import settings
 from ..state import Source
 
+# ExceptionGroup is a builtin only since Python 3.11. The project supports 3.10+,
+# so fall back to the backport or a lightweight shim when running on 3.10.
+if sys.version_info >= (3, 11):
+    from builtins import ExceptionGroup
+else:
+    try:
+        from exceptiongroup import ExceptionGroup
+    except ImportError:
+        # Fallback shim so the rest of the module works on 3.10 without the dep
+        class ExceptionGroup(Exception):
+            def __init__(self, message, exceptions):
+                super().__init__(message)
+                self.exceptions = list(exceptions)
+
+            def __str__(self):
+                return f"{super().__str__()} ({len(self.exceptions)} sub-exceptions)"
+
 logger = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -104,8 +121,6 @@ def _run_coro(coro):
 
 def _unwrap_runtime_error(exc: BaseException) -> BaseException:
     """递归解包 asyncio ExceptionGroup，找到最内层的 RuntimeError。"""
-    from builtins import ExceptionGroup
-
     if isinstance(exc, ExceptionGroup) and len(exc.exceptions) == 1:
         inner = exc.exceptions[0]
         if isinstance(inner, RuntimeError):
@@ -117,8 +132,6 @@ def _unwrap_runtime_error(exc: BaseException) -> BaseException:
 
 def _root_cause_message(exc: BaseException) -> str:
     """递归从 ExceptionGroup / asyncio 包装里提取人类可读的根本原因。"""
-    from builtins import ExceptionGroup
-
     if isinstance(exc, ExceptionGroup):
         causes = [_root_cause_message(sub) for sub in exc.exceptions]
         return "; ".join(c for c in causes if c)

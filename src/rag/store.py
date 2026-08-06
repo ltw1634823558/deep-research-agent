@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 
 _CHROMA_TIMEOUT = 6.0
 _CHROMA_PROBE: bool | None = None  # 模块级缓存：避免重复触发离线阻塞
+_COLL_LOCK = threading.Lock()  # 保护 ephemeral collection 的惰性创建
 
 
 @dataclass
@@ -47,7 +48,9 @@ class ChromaRAGStore:
         self.embedder = embedder or Embedder()
         self.reranker = reranker or Reranker(embedder=self.embedder)
         self._docs: dict[str, RAGDoc] = {}
+        self._chroma_client: Any = None
         self._collection: Any = None
+        self._collection_name = collection
         self._use_chroma = False
 
         want = backend or settings.rag_backend
@@ -82,6 +85,7 @@ class ChromaRAGStore:
                 col.query(query_texts=["probe"], n_results=1)
                 col.delete(ids=["__probe__"])
                 box["col"] = col
+                box["client"] = client
             except Exception as e:  # 降级内存向量库
                 logger.warning(
                     "chroma: 初始化/探针失败（可能离线或网络受限），将降级内存向量库：%s",
@@ -94,6 +98,7 @@ class ChromaRAGStore:
         t.join(_CHROMA_TIMEOUT)
         if "col" in box:
             self._collection = box["col"]
+            self._chroma_client = box["client"]
             _CHROMA_PROBE = True
             return True
         _CHROMA_PROBE = False
@@ -110,12 +115,39 @@ class ChromaRAGStore:
     def backend(self) -> str:
         return "chromadb" if self._use_chroma else "in-memory"
 
+    def _get_collection(self):
+        """返回（并惰性创建一次）ephemeral Chroma collection，跨 add_documents/retrieve 复用。
+
+        避免每次调用都重建向量库：首次调用时创建 client + collection 并缓存，
+        后续调用直接复用 self._collection（__init__ 探测成功时已就绪）。
+        """
+        if self._collection is not None:
+            return self._collection
+        if not self._use_chroma:
+            return None
+        with _COLL_LOCK:
+            if self._collection is not None:
+                return self._collection
+            import chromadb
+            from chromadb.config import Settings
+
+            self._chroma_client = chromadb.Client(
+                settings=Settings(anonymized_telemetry=False, allow_reset=True)
+            )
+            self._collection = self._chroma_client.get_or_create_collection(
+                name=self._collection_name or f"rag_{uuid.uuid4().hex[:8]}",
+                metadata={"hnsw:space": "cosine"},
+                embedding_function=ChromaEmbeddingFunction.create(self.embedder),
+            )
+        return self._collection
+
     def add_documents(self, docs: list[RAGDoc]) -> None:
         if not docs:
             return
         self._docs.update({d.id: d for d in docs})
         if self._use_chroma:
-            self._collection.add(
+            col = self._get_collection()
+            col.add(
                 ids=[d.id for d in docs],
                 documents=[d.text for d in docs],
                 metadatas=[{**d.metadata, "id": d.id} for d in docs],
@@ -130,7 +162,7 @@ class ChromaRAGStore:
         emb_lookup: dict[str, list[float]] | None = None
         if self._use_chroma:
             n = min(k, len(self._docs))
-            res = self._collection.query(query_texts=[query], n_results=n)
+            res = self._get_collection().query(query_texts=[query], n_results=n)
             ids = (res.get("ids") or [[]])[0]
             docs = [self._docs[i] for i in ids if i in self._docs]
         else:

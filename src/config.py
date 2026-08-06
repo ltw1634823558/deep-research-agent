@@ -15,8 +15,7 @@
 
 from __future__ import annotations
 
-import functools
-from typing import Any
+from typing import Any, Optional
 
 from pydantic import field_validator, ValidationInfo
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -192,16 +191,45 @@ def get_settings() -> "Settings":
     return settings
 
 
-@functools.lru_cache(maxsize=1)
-def get_llm():
-    """返回进程级单例 LLM 实例（复用 httpx 连接池）。mock 模式无需任何 key 即可跑通整条管线。"""
-    if settings.llm_provider == "mock":
-        return MockChatModel()
-    from langchain_openai import ChatOpenAI
+# 按「配置指纹」缓存已构建的 LLM 客户端（复用 httpx 连接池）。
+# 不能用 lru_cache 直接缓存 Settings 入参：Settings 可变且不可哈希，
+# 且测试/运行时会 mutate 全局单例属性，必须按取值构造稳定 key。
+_LLM_CACHE: dict[tuple, Any] = {}
 
-    return ChatOpenAI(
-        model=settings.model_name,
-        temperature=settings.temperature,
-        api_key=settings.openai_api_key,
-        base_url=settings.openai_base_url,
+
+def get_llm(s: Optional["Settings"] = None) -> Any:
+    """返回 LLM 实例；`s` 为空时回落到全局单例配置。
+
+    支持依赖注入：节点用 `get_llm(resolve_settings(config))` 即可让按请求 / 按任务
+    覆写的 provider / model / temperature 真正生效，而不是永远拿全局那一份。
+    mock 模式（provider == "mock" 或未配置 api_key）无需任何 key 即可跑通整条管线。
+    """
+    cfg = s if s is not None else settings
+    provider = (cfg.llm_provider or "").strip().lower()
+    has_key = bool(cfg.openai_api_key)
+    use_mock = provider == "mock" or not has_key
+
+    key = (
+        "mock" if use_mock else provider,
+        cfg.model_name,
+        cfg.temperature,
+        cfg.openai_base_url,
+        has_key,
     )
+    cached = _LLM_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    if use_mock:
+        client: Any = MockChatModel()
+    else:
+        from langchain_openai import ChatOpenAI
+
+        client = ChatOpenAI(
+            model=cfg.model_name,
+            temperature=cfg.temperature,
+            api_key=cfg.openai_api_key,
+            base_url=cfg.openai_base_url,
+        )
+    _LLM_CACHE[key] = client
+    return client

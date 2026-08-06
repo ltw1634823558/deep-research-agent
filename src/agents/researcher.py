@@ -6,7 +6,6 @@ from langchain_core.runnables import RunnableConfig
 
 from ..config import get_llm, resolve_settings
 from ..memory import memory_store
-from ..observability import callbacks
 from ..rag.store import ChromaRAGStore, RAGDoc
 from ..state import Finding, ResearchState, Source
 from ..tools.fetch import fetch_url
@@ -79,14 +78,16 @@ def researcher_node(state: ResearchState, config: RunnableConfig) -> dict:
         fetched_parts.append(f"- {tag}（rerank 得分 {r.score}）: {r.text[:500]}")
     fetched = "\n".join(fetched_parts)
 
-    llm = get_llm()
+    llm = get_llm(cfg)
     prompt = (
         f"你是一个研究执行智能体，请基于检索内容与历史记忆，对子主题做简洁摘要（含要点）。\n"
         f"子主题：{subtopic.question}\n\n"
         f"检索内容（已按相关性重排）：\n{fetched}\n\n"
         f"历史记忆：\n{prior_ctx}"
     )
-    summary = llm.invoke(prompt, config={"callbacks": callbacks}).content
+    # 透传节点自身的 RunnableConfig（含本次任务专属 callbacks），
+    # 不再用模块级全局 callbacks 覆盖，避免并发任务 trace 串扰。
+    summary = llm.invoke(prompt, config=config).content
 
     finding = Finding(subtopic_id=subtopic.id, summary=summary, sources=used_sources)
 

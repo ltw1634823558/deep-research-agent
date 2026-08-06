@@ -119,6 +119,9 @@
     background: conic-gradient(var(--accent) calc(var(--v,0)*1%), var(--track) 0); transition: background .6s ease; }
   .gauge::after { content: ""; position: absolute; inset: 9px; border-radius: 50%; background: var(--bg2); }
   .gauge span { position: relative; z-index: 1; font-weight: 700; font-size: 18px; }
+  .stat { width: 92px; height: 92px; border-radius: 50%; display: grid; place-items: center;
+    background: var(--bg2); border: 2px solid var(--card-border); }
+  .stat span { font-weight: 700; font-size: 18px; }
   .gauge-wrap label { display: block; margin-top: 8px; font-size: 12px; color: var(--muted); }
   .sublist, .srclist { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
   .sublist li { display: flex; align-items: center; gap: 8px; font-size: 13px; }
@@ -247,7 +250,7 @@ window.matchMedia("(prefers-color-scheme: light)").addEventListener("change", ()
 
 /* ---------- 工具 ---------- */
 const $ = id => document.getElementById(id);
-function esc(s) { return (s == null ? "" : String(s)).replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c])); }
+function esc(s) { return (s == null ? "" : String(s)).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
 function timeAgo(ts) {
   if (!ts) return "";
   const d = Math.floor((Date.now() / 1000 - ts));
@@ -281,6 +284,11 @@ function gauge(label, v) {
   return `<div class="gauge-wrap"><div class="gauge" style="--v:${pct}"><span>${v != null ? v.toFixed(2) : "—"}</span></div><label>${esc(label)}</label></div>`;
 }
 
+// 计数型指标（非 0-1 比率），用静态圆盘展示，避免误读为百分比
+function stat(label, v) {
+  return `<div class="gauge-wrap"><div class="stat"><span>${v != null ? esc(v) : "—"}</span></div><label>${esc(label)}</label></div>`;
+}
+
 function renderJob(j) {
   $("panel").hidden = false;
   $("empty").hidden = true;
@@ -301,8 +309,11 @@ function renderJob(j) {
   renderStepper(j.stage_index || 0);
 
   const m = j.metrics || {};
+  // 幻觉率 == 1 - 引用召回率（完全共线），只展示其一；另配「来源数」这一独立维度。
+  const srcCount = m.sources_total != null ? m.sources_total : (j.sources || []).length;
   $("metrics").innerHTML = j.status === "done"
-    ? gauge("任务完成率", m.task_completion_rate) + gauge("引用准确率", m.citation_accuracy) + gauge("幻觉率", m.hallucination_rate)
+    ? gauge("任务完成率", m.task_completion_rate) + gauge("引用准确率", m.citation_accuracy)
+      + gauge("引用召回率", m.citation_recall) + stat("来源数", srcCount)
     : '<div class="err">运行结束后生成指标</div>';
 
   $("subtopics").innerHTML = (j.subtopics || []).map(s =>

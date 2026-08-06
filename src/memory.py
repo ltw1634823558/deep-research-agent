@@ -209,8 +209,10 @@ class MemoryStore:
         semantic: SemanticIndex | None = None,
     ) -> None:
         self.path = path or settings.memory_db_path
-        self.enabled = settings.memory_enabled
-        self._init_db()
+        # 不在 import 时固化开关/连接：enabled 在每次调用时重新读取（支持 per-request 覆盖），
+        # sqlite 连接延迟到首次 save/recall 才建立（惰性 + 并发安全）。
+        self._conn: sqlite3.Connection | None = None
+        self._lock = threading.Lock()
         self._index: SemanticIndex | None = semantic
         self.last_recall: list[str] = []
 
@@ -225,28 +227,34 @@ class MemoryStore:
     def index(self, value: SemanticIndex) -> None:
         self._index = value
 
-    def _init_db(self) -> None:
-        if os.path.dirname(self.path):
-            os.makedirs(os.path.dirname(self.path), exist_ok=True)
-        con = sqlite3.connect(self.path)
-        con.execute(
-            "CREATE TABLE IF NOT EXISTS reports ("
-            "id INTEGER PRIMARY KEY, query TEXT, report TEXT, ts TEXT)"
-        )
-        con.commit()
-        con.close()
+    def _ensure_conn(self) -> None:
+        """惰性建立（且仅一次）sqlite 连接：带 timeout 与跨线程开关，建表幂等。"""
+        if self._conn is None:
+            with self._lock:
+                if self._conn is None:
+                    if os.path.dirname(self.path):
+                        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+                    con = sqlite3.connect(
+                        self.path, timeout=30.0, check_same_thread=False
+                    )
+                    con.execute(
+                        "CREATE TABLE IF NOT EXISTS reports ("
+                        "id INTEGER PRIMARY KEY, query TEXT, report TEXT, ts TEXT)"
+                    )
+                    self._conn = con
 
     def save(self, query: str, report: str) -> int:
         """落库报告并写入语义索引，返回写入的洞察条数。"""
-        if not self.enabled:
+        if not settings.memory_enabled:
             return 0
-        con = sqlite3.connect(self.path)
-        con.execute(
-            "INSERT INTO reports (query, report, ts) VALUES (?, ?, ?)",
-            (query, report, datetime.datetime.now().isoformat()),
-        )
-        con.commit()
-        con.close()
+        self._ensure_conn()
+        assert self._conn is not None
+        with self._lock:
+            with self._conn:
+                self._conn.execute(
+                    "INSERT INTO reports (query, report, ts) VALUES (?, ?, ?)",
+                    (query, report, datetime.datetime.now().isoformat()),
+                )
 
         insights = _extract_insights(query, report)
         for ins in insights:
@@ -255,7 +263,7 @@ class MemoryStore:
 
     def recall(self, query: str, k: int | None = None) -> list[str]:
         """召回历史记忆：语义优先，无命中回退关键词。返回可注入上下文的字符串列表。"""
-        if not self.enabled:
+        if not settings.memory_enabled:
             return []
         k = k or settings.memory_top_k
 
@@ -265,9 +273,13 @@ class MemoryStore:
             return hits
 
         # 兜底：SQLite 关键词重叠（向后兼容原有行为）
-        con = sqlite3.connect(self.path)
-        rows = con.execute("SELECT query, report FROM reports").fetchall()
-        con.close()
+        self._ensure_conn()
+        assert self._conn is not None
+        with self._lock:
+            with self._conn:
+                rows = self._conn.execute(
+                    "SELECT query, report FROM reports"
+                ).fetchall()
         q_words = set(query.lower().split())
         scored = [
             (len(q_words & set(q.lower().split())), report) for q, report in rows

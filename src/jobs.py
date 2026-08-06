@@ -162,6 +162,16 @@ class JobStore:
         with self._lock:
             return sorted(self._jobs.values(), key=lambda j: j.created_at, reverse=True)
 
+    def list_snapshots(self) -> list[dict]:
+        """持锁批量序列化，避免后台线程并发写入时读到半更新的 Job（撕裂读）。"""
+        with self._lock:
+            return [
+                j.to_dict()
+                for j in sorted(
+                    self._jobs.values(), key=lambda j: j.created_at, reverse=True
+                )
+            ]
+
     def update(self, job_id: str, **fields: Any) -> None:
         with self._lock:
             job = self._jobs.get(job_id)
