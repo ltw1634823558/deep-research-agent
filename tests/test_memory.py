@@ -24,21 +24,22 @@ def test_semantic_index_memory_ranks_related() -> None:
 
 
 def test_memory_store_save_then_recall() -> None:
-    db = Path(tempfile.gettempdir()) / f"dra_mem_{id(Path)}.db"
-    if db.exists():
-        db.unlink()
-    store = MemoryStore(path=str(db), semantic=SemanticIndex(backend="memory"))
-    report = (
-        "# 报告标题\n"
-        "- 自动驾驶依赖多传感器融合与实时决策\n"
-        "- 端到端神经网络正在替代模块化流水线\n"
-        "> 引用来源示例\n"
-        "```code block```\n"
-    )
-    n = store.save("自动驾驶技术演进", report)
-    assert n >= 2  # 至少写入两条洞察
-    hits = store.recall("自动驾驶 传感器融合", k=3)
-    assert any("传感器融合" in h for h in hits)
+    # 用临时目录隔离，避免跨测试 / 跨次向仓库根目录写入真实 sqlite 文件（非密闭副作用）
+    with tempfile.TemporaryDirectory() as d:
+        db = Path(d) / "memory.db"
+        store = MemoryStore(path=str(db), semantic=SemanticIndex(backend="memory"))
+        report = (
+            "# 报告标题\n"
+            "- 自动驾驶依赖多传感器融合与实时决策\n"
+            "- 端到端神经网络正在替代模块化流水线\n"
+            "> 引用来源示例\n"
+            "```code block```\n"
+        )
+        n = store.save("自动驾驶技术演进", report)
+        assert n >= 2  # 至少写入两条洞察
+        hits = store.recall("自动驾驶 传感器融合", k=3)
+        assert any("传感器融合" in h for h in hits)
+        store.close()  # 释放 SQLite 连接，确保临时目录可被删除
 
 
 def test_extract_insights_skips_noise() -> None:

@@ -289,5 +289,17 @@ class MemoryStore:
         self.last_recall = [report for _, report in scored[:k]]
         return self.last_recall
 
+    def close(self) -> None:
+        """释放 SQLite 连接，便于测试与进程退出时的确定性清理。
+
+        连接为惰性长连接（见 _ensure_conn），不主动关闭会导致 Windows 下
+        持有文件锁、临时目录/文件无法删除。
+        """
+        with self._lock:
+            con = self._conn
+            self._conn = None
+            if con is not None:
+                con.close()
+
 
 memory_store = MemoryStore()

@@ -57,10 +57,16 @@ def test_research_job_runs_to_done():
     assert detail["progress"] == 100
 
 
-def test_sync_research_also_records_job():
-    before = len(client.get("/api/jobs").json())
+def test_sync_research_also_records_job(monkeypatch):
+    # 隔离 store：用独立 JobStore 替换 server 模块级单例，避免依赖全局作业计数
+    # （防止其他测试写入或 LRU 淘汰干扰前后差值断言），保证测试密闭可重复。
+    from src.jobs import JobStore
+
+    isolated = JobStore()
+    monkeypatch.setattr("src.server.store", isolated)
+    before = len(isolated.list_snapshots())
     r = client.post("/research", json={"query": "同步接口也应记入面板", "mode": "web"})
     assert r.status_code == 200
     assert r.json()["metrics"]
-    after = len(client.get("/api/jobs").json())
+    after = len(isolated.list_snapshots())
     assert after == before + 1
