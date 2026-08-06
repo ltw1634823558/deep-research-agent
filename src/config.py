@@ -1,38 +1,81 @@
-"""全局配置：从环境变量加载，兼容 OpenAI / 兼容端点 / 离线 mock 模式。"""
+"""全局配置：pydantic-settings 驱动，从环境变量加载，兼容 OpenAI / 兼容端点 / 离线 mock 模式。
+
+设计要点（相对旧版 @dataclass 的迁移收益）：
+- 类型安全：所有字段带类型注解，pydantic 在建表期即校验（字符串/整型/布尔混用直接报错）。
+- 健壮的空值兜底：`field_validator` 把 env 里的空串 / 非法值回落到默认值，
+  不再出现 `RAG_TOP_K=` 空值导致 `int("")` 抛 ValueError、整包无法 import 的事故。
+- 依赖注入就绪：`settings` 仍保留为进程级全局单例（兼容 `from .config import settings` 与
+  测试里的 `monkeypatch.setattr(settings, ...)`），同时新增 `resolve_settings(config)`
+  （节点优先读取 `RunnableConfig['configurable']['settings']`，支持按请求覆盖）与
+  `get_settings()`（FastAPI `Depends` 依赖），满足多租户 / 按请求覆写的可扩展性。
+- 运行时读 .env 的语义保持不变：本模块 `env_file=None`，由入口（main.py / server.py）的
+  `load_dotenv(override=True)` 把 .env 注入 os.environ 后，Settings() 从 os.environ 取值；
+  测试环境不调用 load_dotenv，因此天然离线、零网络依赖。
+"""
 
 from __future__ import annotations
 
 import functools
-import os
-from dataclasses import dataclass
+from typing import Any
+
+from pydantic import field_validator, ValidationInfo
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .mock import MockChatModel
 
 
-def _int_env(name: str, default: int) -> int:
-    """安全读取整型环境变量：缺失/空串/非法值一律回落默认值（import 期不崩）。"""
-    v = os.getenv(name)
-    if v is None or v.strip() == "":
+# —— 数值 / 布尔字段的空值兜底（替代旧版 _int_env / _float_env 手工解析） ——
+_INT_DEFAULTS: dict[str, int] = {
+    "rag_top_k": 4,
+    "memory_top_k": 3,
+    "analyst_self_heal": 2,
+    "max_research_iterations": 3,
+    "research_window": 10,
+}
+_FLOAT_DEFAULTS: dict[str, float] = {"temperature": 0.2}
+
+
+def _coerce_to_int(v: Any, default: int) -> int:
+    """空串 / None / 非法字符串 → 默认；布尔显式拦掉（避免 True→1 的意外）。"""
+    if v is None or isinstance(v, bool):
         return default
-    try:
+    if isinstance(v, (int, float)):
         return int(v)
-    except (ValueError, TypeError):
-        return default
+    if isinstance(v, str):
+        s = v.strip()
+        if s == "":
+            return default
+        try:
+            return int(s)
+        except ValueError:
+            return default
+    return default
 
 
-def _float_env(name: str, default: float) -> float:
-    """安全读取浮点型环境变量：缺失/空串/非法值一律回落默认值。"""
-    v = os.getenv(name)
-    if v is None or v.strip() == "":
+def _coerce_to_float(v: Any, default: float) -> float:
+    if v is None or isinstance(v, bool):
         return default
-    try:
+    if isinstance(v, (int, float)):
         return float(v)
-    except (ValueError, TypeError):
-        return default
+    if isinstance(v, str):
+        s = v.strip()
+        if s == "":
+            return default
+        try:
+            return float(s)
+        except ValueError:
+            return default
+    return default
 
 
-@dataclass
-class Settings:
+class Settings(BaseSettings):
+    # 关闭自动读 .env：运行时由 load_dotenv() 注入 os.environ，测试不加载则天然离线。
+    model_config = SettingsConfigDict(
+        env_file=None,
+        extra="ignore",
+        case_sensitive=False,
+    )
+
     llm_provider: str = "mock"  # mock | openai
     openai_api_key: str = ""
     openai_base_url: str = "https://api.openai.com/v1"
@@ -86,43 +129,67 @@ class Settings:
     max_research_iterations: int = 3
     research_window: int = 10
 
+    @field_validator(
+        "rag_top_k",
+        "memory_top_k",
+        "analyst_self_heal",
+        "max_research_iterations",
+        "research_window",
+        mode="before",
+    )
     @classmethod
-    def from_env(cls) -> Settings:
-        return cls(
-            llm_provider=os.getenv("LLM_PROVIDER", "mock").strip(),
-            openai_api_key=os.getenv("OPENAI_API_KEY", "").strip(),
-            openai_base_url=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").strip(),
-            model_name=os.getenv("MODEL_NAME", "gpt-4o-mini").strip(),
-            temperature=_float_env("TEMPERATURE", 0.2),
-            tavily_api_key=os.getenv("TAVILY_API_KEY", "").strip(),
-            search_provider=os.getenv("SEARCH_PROVIDER", "tavily").strip(),
-            embedding_provider=os.getenv("EMBEDDING_PROVIDER", "mock").strip(),
-            embedding_api_key=os.getenv("EMBEDDING_API_KEY", "").strip(),
-            embedding_base_url=os.getenv("EMBEDDING_BASE_URL", "").strip(),
-            embedding_model=os.getenv("EMBEDDING_MODEL", "text-embedding-3-small").strip(),
-            rerank_provider=os.getenv("RERANK_PROVIDER", "mock").strip(),
-            cohere_api_key=os.getenv("COHERE_API_KEY", "").strip(),
-            rag_top_k=_int_env("RAG_TOP_K", 4),
-            rag_backend=os.getenv("RAG_BACKEND", "auto"),
-            memory_enabled=os.getenv("MEMORY_ENABLED", "true").lower() in ("1", "true", "yes", "on"),
-            memory_backend=os.getenv("MEMORY_BACKEND", "auto"),
-            memory_path=os.getenv("MEMORY_PATH", ".memory_store"),
-            memory_db_path=os.getenv("MEMORY_DB_PATH", "memory.db"),
-            memory_top_k=_int_env("MEMORY_TOP_K", 3),
-            analyst_self_heal=_int_env("ANALYST_SELF_HEAL", 2),
-            analyst_critic=os.getenv("ANALYST_CRITIC", "heuristic"),
-            mcp_server_command=os.getenv("MCP_SERVER_COMMAND", ""),
-            obsidian_vault_path=os.getenv("OBSIDIAN_VAULT_PATH", ""),
-            research_mode=os.getenv("RESEARCH_MODE", "web"),
-            langfuse_public_key=os.getenv("LANGFUSE_PUBLIC_KEY", ""),
-            langfuse_secret_key=os.getenv("LANGFUSE_SECRET_KEY", ""),
-            langfuse_host=os.getenv("LANGFUSE_HOST", "https://cloud.langfuse.com"),
-            max_research_iterations=_int_env("MAX_RESEARCH_ITERATIONS", 3),
-            research_window=_int_env("RESEARCH_WINDOW", 10),
-        )
+    def _coerce_int_fields(cls, v: Any, info: ValidationInfo) -> int:
+        name = info.field_name or ""
+        return _coerce_to_int(v, _INT_DEFAULTS.get(name, 0))
+
+    @field_validator("temperature", mode="before")
+    @classmethod
+    def _coerce_temperature(cls, v: Any, info: ValidationInfo) -> float:
+        name = info.field_name or "temperature"
+        return _coerce_to_float(v, _FLOAT_DEFAULTS.get(name, 0.2))
+
+    @field_validator("memory_enabled", mode="before")
+    @classmethod
+    def _coerce_memory_enabled(cls, v: Any) -> bool:
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, str):
+            return v.strip().lower() in ("1", "true", "yes", "on")
+        return bool(v)
+
+    @classmethod
+    def from_env(cls) -> "Settings":
+        """向后兼容：原 @dataclass 的 `Settings.from_env()` 构造口，等价于 `Settings()`。"""
+        return cls()
 
 
+# 进程级全局配置单例：兼容 `from .config import settings` 与测试里的属性 mutate。
 settings = Settings.from_env()
+
+
+def resolve_settings(config: Any = None) -> "Settings":
+    """节点优先使用按请求注入的配置 `RunnableConfig['configurable']['settings']`，
+    未提供时回落到全局单例。这样同一份代码既能跑全局默认，也支持多租户 / 按请求覆写。
+
+    `config` 在 LangGraph 运行时是 `RunnableConfig`（TypedDict，即 dict）。
+    """
+    if isinstance(config, dict):
+        configurable = config.get("configurable")
+        if isinstance(configurable, dict):
+            candidate = configurable.get("settings")
+            if isinstance(candidate, Settings):
+                return candidate
+    return settings
+
+
+def get_settings() -> "Settings":
+    """FastAPI 依赖：返回全局配置单例。
+
+    后续可按需扩展为「按请求从 query/header/租户上下文构造 Settings」——
+    所有通过 `Depends(get_settings)` 拿到配置并透传进 `graph.stream(config={"configurable": {"settings": ...}})`
+    的调用点，都会自动享受到按请求覆写，无需改动节点内部。
+    """
+    return settings
 
 
 @functools.lru_cache(maxsize=1)

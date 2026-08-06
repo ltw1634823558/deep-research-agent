@@ -4,7 +4,7 @@ from __future__ import annotations
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableConfig
 
-from ..config import get_llm, settings
+from ..config import get_llm, resolve_settings
 from ..memory import memory_store
 from ..observability import callbacks
 from ..rag.store import ChromaRAGStore, RAGDoc
@@ -22,12 +22,13 @@ def _source_text(s: Source) -> str:
 
 
 def researcher_node(state: ResearchState, config: RunnableConfig) -> dict:
+    cfg = resolve_settings(config)
     subtopic = next((s for s in state["plan"] if s.status == "pending"), None)
     if subtopic is None:
         return {}
 
     # 按研究模式聚合来源：web / local / hybrid
-    mode = state.get("mode") or settings.research_mode
+    mode = state.get("mode") or cfg.research_mode
     sources: list[Source] = []
     if mode in ("web", "hybrid"):
         sources += search(subtopic.question)
@@ -54,7 +55,7 @@ def researcher_node(state: ResearchState, config: RunnableConfig) -> dict:
             )
         )
     store.add_documents(docs)
-    ranked = store.retrieve(subtopic.question, top_k=settings.rag_top_k)
+    ranked = store.retrieve(subtopic.question, top_k=cfg.rag_top_k)
 
     # 只保留真正喂给 LLM 的重排 top_k 来源（候选集不外泄到 state，避免来源膨胀/无关引用）
     id_to_source = {d.id: d.source for d in docs}

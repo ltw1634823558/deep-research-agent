@@ -14,7 +14,7 @@ import re
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableConfig
 
-from ..config import get_llm, settings
+from ..config import get_llm, resolve_settings
 from ..observability import callbacks
 from ..state import Finding, ResearchState, Subtopic
 
@@ -57,6 +57,7 @@ def _critique_analysis(findings: list[Finding], analysis: str) -> tuple[bool, li
 
 
 def analyst_node(state: ResearchState, config: RunnableConfig) -> dict:
+    cfg = resolve_settings(config)
     llm = get_llm()
     findings_text = "\n".join(f"[{f.subtopic_id}] {f.summary}" for f in state["findings"])
     base_prompt = (
@@ -69,8 +70,8 @@ def analyst_node(state: ResearchState, config: RunnableConfig) -> dict:
     ok = True  # 最近一次批判结论（mock 模式不批判，视为通过）
 
     # 仅真实 LLM 进入自愈循环：自我批判 → 修订，最多 analyst_self_heal 次
-    if settings.llm_provider == "openai":
-        max_attempts = max(1, settings.analyst_self_heal)
+    if cfg.llm_provider == "openai":
+        max_attempts = max(1, cfg.analyst_self_heal)
         for attempt in range(1, max_attempts + 1):
             ok, issues = _critique_analysis(state["findings"], analysis)
             if ok:
@@ -87,7 +88,7 @@ def analyst_node(state: ResearchState, config: RunnableConfig) -> dict:
 
     # 是否触发补充检索回环：缺口标记（向后兼容）或 真实 LLM 下批判未通过
     needs_more = ("缺口" in analysis) or bool(_GAP_RE.search(analysis))
-    if settings.llm_provider == "openai":
+    if cfg.llm_provider == "openai":
         # 复用循环内已算出的批判结论，无需重复评估
         if not ok and state["iteration"] < state["max_iterations"]:
             needs_more = True

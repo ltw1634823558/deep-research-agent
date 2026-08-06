@@ -21,11 +21,11 @@ try:
 except Exception:
     pass
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
-from .config import settings
+from .config import Settings, get_settings, settings
 from .evaluation import evaluate
 from .graph import build_graph
 from .jobs import STAGES, JobStatus, _to_sources, _to_subtopics, store
@@ -131,11 +131,16 @@ def _finalize_job(
     )
 
 
-def _run_job(job_id: str, query: str, mode: str) -> None:
-    """后台线程：用 graph.stream 实时推进 JobStore 状态。"""
+def _run_job(job_id: str, query: str, mode: str, cfg: Settings) -> None:
+    """后台线程：用 graph.stream 实时推进 JobStore 状态。
+
+    `cfg` 为按请求注入的配置（经 FastAPI `Depends(get_settings)` 取得），透传进
+    `graph.stream` 的 `configurable['settings']`，节点内通过 `resolve_settings(config)` 取用，
+    从而支持同一份代码按请求覆写参数（多租户 / A/B 实验）。
+    """
     try:
         store.update(job_id, status=JobStatus.RUNNING.value, stage_index=0)
-        inputs = initial_state(query, settings.max_research_iterations, mode=mode)
+        inputs = initial_state(query, cfg.max_research_iterations, mode=mode)
 
         # 本地累加器：'updates' 模式只给增量，需要自己汇总
         cur_plan: list = []
@@ -149,7 +154,11 @@ def _run_job(job_id: str, query: str, mode: str) -> None:
         # 每个任务取一份独立回调，避免并发线程共享 handler 造成 trace 串扰
         job_callbacks = get_callbacks()
 
-        for chunk in graph.stream(inputs, stream_mode="updates", config={"callbacks": job_callbacks}):
+        for chunk in graph.stream(
+            inputs,
+            stream_mode="updates",
+            config={"configurable": {"settings": cfg}, "callbacks": job_callbacks},
+        ):
             node = next(iter(chunk.keys()))
             patch = chunk[node] or {}
             if node in _NODE_TO_STAGE:
@@ -198,9 +207,9 @@ def health():
 
 
 @app.post("/research", response_model=ResearchResponse)
-def research(req: ResearchRequest):
-    state = initial_state(req.query, settings.max_research_iterations, mode=req.mode)
-    result = graph.invoke(state)
+def research(req: ResearchRequest, cfg: Settings = Depends(get_settings)):
+    state = initial_state(req.query, cfg.max_research_iterations, mode=req.mode)
+    result = graph.invoke(state, config={"configurable": {"settings": cfg}})
     metrics = evaluate(result).to_dict()
 
     # 同步运行也记入 JobStore，供 dashboard 看历史
@@ -233,9 +242,9 @@ def research(req: ResearchRequest):
 
 
 @app.post("/research/job")
-def research_job(req: ResearchRequest):
+def research_job(req: ResearchRequest, cfg: Settings = Depends(get_settings)):
     job = store.create(req.query, req.mode, _config_snapshot())
-    _JOB_EXECUTOR.submit(_run_job, job.id, req.query, req.mode)
+    _JOB_EXECUTOR.submit(_run_job, job.id, req.query, req.mode, cfg)
     return {"job_id": job.id, "dashboard_url": f"/dashboard?job={job.id}"}
 
 
