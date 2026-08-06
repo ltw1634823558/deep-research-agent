@@ -9,6 +9,8 @@
 
 from __future__ import annotations
 
+import re
+
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableConfig
 
@@ -17,10 +19,10 @@ from ..observability import callbacks
 from ..state import Finding, ResearchState, Subtopic
 
 # 低置信 / 不确定表述标记（命中即视为分析不可靠，需要修补或补充检索）
-_LOW_CONF = [
-    "不确定", "不清楚", "缺乏", "不足", "无法判断", "需要更多", "数据不足",
-    "unknown", "uncertain", "gap", "insufficient", "lacks",
-]
+# 中文按子串匹配（无词边界概念）；英文必须整词匹配，否则 "Singapore" 会被 "gap" 子串误判。
+_LOW_CONF_CN = ["不确定", "不清楚", "缺乏", "不足", "无法判断", "需要更多", "数据不足"]
+_GAP_RE = re.compile(r"\b(gap|gaps|uncertain|lacks|incomplete)\b", re.IGNORECASE)
+_EN_LOW_CONF_RE = re.compile(r"\b(unknown|insufficient)\b", re.IGNORECASE)
 
 
 def _critique_analysis(findings: list[Finding], analysis: str) -> tuple[bool, list[str]]:
@@ -43,7 +45,10 @@ def _critique_analysis(findings: list[Finding], analysis: str) -> tuple[bool, li
         cov = covered / len(findings)
         if cov < 0.8:
             issues.append(f"覆盖不足：仅 {covered}/{len(findings)} 个子主题发现被分析引用")
-    low = [w for w in _LOW_CONF if w in analysis.lower()]
+    low = [w for w in _LOW_CONF_CN if w in analysis]
+    low += [m.group(0).lower() for m in _GAP_RE.finditer(analysis)]
+    low += [m.group(0).lower() for m in _EN_LOW_CONF_RE.finditer(analysis)]
+    low = list(dict.fromkeys(low))
     if low:
         issues.append("分析含低置信/不确定表述：" + "/".join(low))
     if len(analysis) < 40:
@@ -61,6 +66,7 @@ def analyst_node(state: ResearchState, config: RunnableConfig) -> dict:
     )
     analysis = llm.invoke(base_prompt, config={"callbacks": callbacks}).content
     self_heal = 0
+    ok = True  # 最近一次批判结论（mock 模式不批判，视为通过）
 
     # 仅真实 LLM 进入自愈循环：自我批判 → 修订，最多 analyst_self_heal 次
     if settings.llm_provider == "openai":
@@ -80,9 +86,9 @@ def analyst_node(state: ResearchState, config: RunnableConfig) -> dict:
                 break  # 调用失败则保留上一版，不中断管线
 
     # 是否触发补充检索回环：缺口标记（向后兼容）或 真实 LLM 下批判未通过
-    needs_more = ("缺口" in analysis) or ("GAP" in analysis.upper())
+    needs_more = ("缺口" in analysis) or bool(_GAP_RE.search(analysis))
     if settings.llm_provider == "openai":
-        ok, _ = _critique_analysis(state["findings"], analysis)
+        # 复用循环内已算出的批判结论，无需重复评估
         if not ok and state["iteration"] < state["max_iterations"]:
             needs_more = True
 

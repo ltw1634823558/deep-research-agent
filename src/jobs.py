@@ -12,12 +12,16 @@ from __future__ import annotations
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any
 
 # 阶段顺序：驱动进度（0-100）与前端步进器，单一真源。
 STAGES = ["planning", "researching", "analyzing", "writing", "evaluating", "done"]
+
+# 内存上限：只保留最近 N 个任务，超出时按插入顺序淘汰最旧的（防止无界增长）。
+MAX_JOBS = 50
 
 
 class JobStatus(str, Enum):
@@ -118,21 +122,41 @@ def _to_sources(sources: Any) -> list[SourceView]:
 
 
 class JobStore:
-    """线程安全的作业注册表（进程内单例）。"""
+    """线程安全的作业注册表（进程内单例，容量受限的 LRU）。"""
 
-    def __init__(self) -> None:
-        self._jobs: dict[str, Job] = {}
+    def __init__(self, max_jobs: int = MAX_JOBS) -> None:
+        self._jobs: OrderedDict[str, Job] = OrderedDict()
+        self._max_jobs = max_jobs
         self._lock = threading.Lock()
+
+    def _evict_locked(self) -> None:
+        """在持锁状态下淘汰最旧的任务，保持容量不超过 _max_jobs。"""
+        while len(self._jobs) > self._max_jobs:
+            self._jobs.popitem(last=False)
 
     def create(self, query: str, mode: str, config: dict | None = None) -> Job:
         job = Job(id=uuid.uuid4().hex[:12], query=query, mode=mode, config=config or {})
         with self._lock:
             self._jobs[job.id] = job
+            self._jobs.move_to_end(job.id)
+            self._evict_locked()
         return job
 
     def get(self, job_id: str) -> Job | None:
         with self._lock:
-            return self._jobs.get(job_id)
+            job = self._jobs.get(job_id)
+            if job is not None:
+                self._jobs.move_to_end(job_id)
+            return job
+
+    def snapshot(self, job_id: str) -> dict | None:
+        """持锁生成任务快照，避免读到写线程的中间状态。"""
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return None
+            self._jobs.move_to_end(job_id)
+            return job.to_dict()
 
     def list(self) -> list[Job]:
         with self._lock:
@@ -146,6 +170,7 @@ class JobStore:
             for k, v in fields.items():
                 setattr(job, k, v)
             job.updated_at = time.time()
+            self._jobs.move_to_end(job_id)
 
     def set_stage(self, job_id: str, stage_index: int) -> None:
         with self._lock:
@@ -156,6 +181,7 @@ class JobStore:
             total = len(STAGES) - 1
             job.progress = int(round(stage_index / total * 100))
             job.updated_at = time.time()
+            self._jobs.move_to_end(job_id)
 
 
 # 进程内单例

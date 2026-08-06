@@ -56,6 +56,21 @@ def researcher_node(state: ResearchState, config: RunnableConfig) -> dict:
     store.add_documents(docs)
     ranked = store.retrieve(subtopic.question, top_k=settings.rag_top_k)
 
+    # 只保留真正喂给 LLM 的重排 top_k 来源（候选集不外泄到 state，避免来源膨胀/无关引用）
+    id_to_source = {d.id: d.source for d in docs}
+    used_sources: list[Source] = []
+    seen_urls: set[str] = set()
+    for r in ranked:
+        s = id_to_source.get(r.id)
+        if s is None:
+            continue
+        key = (s.url or "").strip().lower()
+        if key and key in seen_urls:
+            continue
+        if key:
+            seen_urls.add(key)
+        used_sources.append(s)
+
     # 用重排后的精排上下文喂给 LLM（召回阶段已按相关性排序）
     fetched_parts = []
     for r in ranked:
@@ -72,7 +87,7 @@ def researcher_node(state: ResearchState, config: RunnableConfig) -> dict:
     )
     summary = llm.invoke(prompt, config={"callbacks": callbacks}).content
 
-    finding = Finding(subtopic_id=subtopic.id, summary=summary, sources=sources)
+    finding = Finding(subtopic_id=subtopic.id, summary=summary, sources=used_sources)
 
     # 标记该子主题为已完成
     new_plan = [
@@ -82,7 +97,7 @@ def researcher_node(state: ResearchState, config: RunnableConfig) -> dict:
     return {
         "findings": [finding],
         "plan": new_plan,
-        "sources": sources,
+        "sources": used_sources,
         "memory_recall": prior,  # 本轮子主题召回到的历史洞察（dashboard 展示）
         "messages": [AIMessage(content=f"[Researcher] 完成子主题：{subtopic.question}（RAG 后端：{store.backend}）")],
     }

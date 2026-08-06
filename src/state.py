@@ -29,13 +29,31 @@ class Finding(BaseModel):
     sources: list[Source] = Field(default_factory=list)
 
 
+def _add_sources(existing: list[Source] | None, new: list[Source] | None) -> list[Source]:
+    """sources 归并 reducer：按归一化 URL 去重，保留首次出现顺序，先到先得。
+
+    替代 `operator.add`：后者在每次累加时重复堆叠同一 URL（跨子主题重复检索到同一网页），
+    导致来源列表膨胀、评估分母失真。
+    """
+    merged: list[Source] = []
+    seen: set[str] = set()
+    for s in list(existing or []) + list(new or []):
+        key = (s.url or "").strip().lower()
+        if key:
+            if key in seen:
+                continue
+            seen.add(key)
+        merged.append(s)
+    return merged
+
+
 class ResearchState(TypedDict):
     query: str
     plan: list[Subtopic]
     findings: Annotated[list[Finding], add]
     analysis: str
     report: str
-    sources: Annotated[list[Source], add]
+    sources: Annotated[list[Source], _add_sources]
     iteration: int
     max_iterations: int
     mode: str  # web | local | hybrid（研究模式，决定检索来源）

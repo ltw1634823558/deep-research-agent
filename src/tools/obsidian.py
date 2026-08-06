@@ -199,10 +199,25 @@ class ObsidianVault:
         self._build_links()
 
 
-# 模块级单例：首次导入即尝试加载用户仓库，失败则用合成仓库
-obsidian_vault = ObsidianVault(settings.obsidian_vault_path or None)
+# 模块级惰性单例：首次真正检索笔记时才扫描用户仓库（import 时不做整库 rglob），
+# 仓库无效则降级合成仓库。
+_vault: ObsidianVault | None = None
+
+
+def _get_vault() -> ObsidianVault:
+    global _vault
+    if _vault is None:
+        _vault = ObsidianVault(settings.obsidian_vault_path or None)
+    return _vault
+
+
+def __getattr__(name: str) -> object:
+    """PEP 562：让 `from ...obsidian import obsidian_vault` 仍可用，但按需构建。"""
+    if name == "obsidian_vault":
+        return _get_vault()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def obsidian_search(query: str, top_k: int = 5, use_graph: bool = True) -> list[Source]:
     """对上层透明的 Obsidian 检索入口；无仓库时返回合成结果，保证离线可跑、可测。"""
-    return obsidian_vault.retrieve(query, top_k=top_k, use_graph=use_graph)
+    return _get_vault().retrieve(query, top_k=top_k, use_graph=use_graph)

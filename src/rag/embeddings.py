@@ -9,10 +9,13 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import math
 from typing import Any
 
 from ..config import settings
+
+logger = logging.getLogger(__name__)
 
 DIM = 256
 
@@ -46,16 +49,27 @@ class Embedder:
         if self.provider == "openai" and (self.api_key or self.base_url):
             try:
                 return self._real_client().embed_query(text)
-            except Exception:
-                pass  # 失败降级 mock
+            except Exception as e:  # 失败降级 mock
+                logger.warning(
+                    "embed: OpenAI 兼容端点调用失败（model=%s），降级 mock 哈希向量：%s",
+                    self.model,
+                    e,
+                    exc_info=False,
+                )
         return self._mock_embed(text)
 
     def embed_batch(self, texts: list[str]) -> list[list[float]]:
         if self.provider == "openai" and (self.api_key or self.base_url):
             try:
                 return self._real_client().embed_documents(texts)
-            except Exception:
-                pass  # 失败降级逐条 mock
+            except Exception as e:  # 失败降级逐条 mock
+                logger.warning(
+                    "embed_batch: OpenAI 兼容端点调用失败（model=%s, n=%d），降级 mock 哈希向量：%s",
+                    self.model,
+                    len(texts),
+                    e,
+                    exc_info=False,
+                )
         return [self._mock_embed(t) for t in texts]
 
     @staticmethod

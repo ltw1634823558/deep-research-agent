@@ -2,10 +2,33 @@
 
 from __future__ import annotations
 
+import functools
 import os
 from dataclasses import dataclass
 
 from .mock import MockChatModel
+
+
+def _int_env(name: str, default: int) -> int:
+    """安全读取整型环境变量：缺失/空串/非法值一律回落默认值（import 期不崩）。"""
+    v = os.getenv(name)
+    if v is None or v.strip() == "":
+        return default
+    try:
+        return int(v)
+    except (ValueError, TypeError):
+        return default
+
+
+def _float_env(name: str, default: float) -> float:
+    """安全读取浮点型环境变量：缺失/空串/非法值一律回落默认值。"""
+    v = os.getenv(name)
+    if v is None or v.strip() == "":
+        return default
+    try:
+        return float(v)
+    except (ValueError, TypeError):
+        return default
 
 
 @dataclass
@@ -70,6 +93,7 @@ class Settings:
             openai_api_key=os.getenv("OPENAI_API_KEY", "").strip(),
             openai_base_url=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").strip(),
             model_name=os.getenv("MODEL_NAME", "gpt-4o-mini").strip(),
+            temperature=_float_env("TEMPERATURE", 0.2),
             tavily_api_key=os.getenv("TAVILY_API_KEY", "").strip(),
             search_provider=os.getenv("SEARCH_PROVIDER", "tavily").strip(),
             embedding_provider=os.getenv("EMBEDDING_PROVIDER", "mock").strip(),
@@ -78,14 +102,14 @@ class Settings:
             embedding_model=os.getenv("EMBEDDING_MODEL", "text-embedding-3-small").strip(),
             rerank_provider=os.getenv("RERANK_PROVIDER", "mock").strip(),
             cohere_api_key=os.getenv("COHERE_API_KEY", "").strip(),
-            rag_top_k=int(os.getenv("RAG_TOP_K", "4")),
+            rag_top_k=_int_env("RAG_TOP_K", 4),
             rag_backend=os.getenv("RAG_BACKEND", "auto"),
             memory_enabled=os.getenv("MEMORY_ENABLED", "true").lower() in ("1", "true", "yes", "on"),
             memory_backend=os.getenv("MEMORY_BACKEND", "auto"),
             memory_path=os.getenv("MEMORY_PATH", ".memory_store"),
             memory_db_path=os.getenv("MEMORY_DB_PATH", "memory.db"),
-            memory_top_k=int(os.getenv("MEMORY_TOP_K", "3")),
-            analyst_self_heal=int(os.getenv("ANALYST_SELF_HEAL", "2")),
+            memory_top_k=_int_env("MEMORY_TOP_K", 3),
+            analyst_self_heal=_int_env("ANALYST_SELF_HEAL", 2),
             analyst_critic=os.getenv("ANALYST_CRITIC", "heuristic"),
             mcp_server_command=os.getenv("MCP_SERVER_COMMAND", ""),
             obsidian_vault_path=os.getenv("OBSIDIAN_VAULT_PATH", ""),
@@ -93,16 +117,17 @@ class Settings:
             langfuse_public_key=os.getenv("LANGFUSE_PUBLIC_KEY", ""),
             langfuse_secret_key=os.getenv("LANGFUSE_SECRET_KEY", ""),
             langfuse_host=os.getenv("LANGFUSE_HOST", "https://cloud.langfuse.com"),
-            max_research_iterations=int(os.getenv("MAX_RESEARCH_ITERATIONS", "3")),
-            research_window=int(os.getenv("RESEARCH_WINDOW", "10")),
+            max_research_iterations=_int_env("MAX_RESEARCH_ITERATIONS", 3),
+            research_window=_int_env("RESEARCH_WINDOW", 10),
         )
 
 
 settings = Settings.from_env()
 
 
+@functools.lru_cache(maxsize=1)
 def get_llm():
-    """返回 LLM 实例。mock 模式无需任何 key 即可跑通整条管线。"""
+    """返回进程级单例 LLM 实例（复用 httpx 连接池）。mock 模式无需任何 key 即可跑通整条管线。"""
     if settings.llm_provider == "mock":
         return MockChatModel()
     from langchain_openai import ChatOpenAI

@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import sys
+import threading
 from pathlib import Path
 
 from mcp.client.stdio import StdioServerParameters, stdio_client
@@ -68,6 +69,39 @@ async def _call_tool(command: list[str], query: str, max_results: int) -> str:
         return ""
 
 
+def _run_in_thread(coro):
+    """在独立后台线程里跑一个全新的事件循环，避免「已运行循环中再 asyncio.run」的 RuntimeError。
+
+    仍保持每次调用启动子进程（subprocess-per-call）模型；不实现共享长连接会话。
+    """
+    result_holder: dict = {}
+
+    def _worker() -> None:
+        loop = asyncio.new_event_loop()
+        try:
+            result_holder["value"] = loop.run_until_complete(coro)
+        except BaseException as exc:  # noqa: BLE001 - 跨线程透传给主线程
+            result_holder["error"] = exc
+        finally:
+            loop.close()
+
+    thread = threading.Thread(target=_worker)
+    thread.start()
+    thread.join()
+    if "error" in result_holder:
+        raise result_holder["error"]
+    return result_holder["value"]
+
+
+def _run_coro(coro):
+    """循环安全执行协程：若已在事件循环中，则放到后台线程跑；否则用 asyncio.run。"""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    return _run_in_thread(coro)
+
+
 def _unwrap_runtime_error(exc: BaseException) -> BaseException:
     """递归解包 asyncio ExceptionGroup，找到最内层的 RuntimeError。"""
     from builtins import ExceptionGroup
@@ -95,7 +129,7 @@ def search_via_mcp(query: str, max_results: int = 5) -> list[Source]:
     """经 MCP Server 检索，返回 Source 列表；失败直接抛异常，不再静默降级 mock。"""
     command = _resolve_command()
     try:
-        raw = asyncio.run(_call_tool(command, query, max_results))
+        raw = _run_coro(_call_tool(command, query, max_results))
         data = json.loads(raw)
         return [
             Source(
@@ -105,8 +139,8 @@ def search_via_mcp(query: str, max_results: int = 5) -> list[Source]:
             )
             for r in data
         ]
-    except BaseException as e:
-        # asyncio.run 可能把异常包在 ExceptionGroup 里，解包后若已是 RuntimeError 直接抛出
+    except Exception as e:
+        # 跨线程的异常已是原始异常；asyncio.run 可能把异常包在 ExceptionGroup 里，解包后若已是 RuntimeError 直接抛出
         inner = _unwrap_runtime_error(e)
         if isinstance(inner, RuntimeError):
             logger.error("MCP 检索失败: %s", inner)

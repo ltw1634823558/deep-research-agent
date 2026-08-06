@@ -10,9 +10,9 @@
 """
 from __future__ import annotations
 
-import threading
+import concurrent.futures
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 
 try:
     from dotenv import load_dotenv
@@ -23,18 +23,23 @@ except Exception:
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .config import settings
 from .evaluation import evaluate
 from .graph import build_graph
 from .jobs import STAGES, JobStatus, _to_sources, _to_subtopics, store
 from .memory import memory_store
-from .observability import callbacks
+from .observability import get_callbacks
 from .state import ResearchState, initial_state
 
 app = FastAPI(title="Deep Research Agent API", version="1.0.0")
 graph = build_graph()
+
+# 后台任务并发上限：避免每个请求裸起线程压垮进程 / 打爆下游 API 配额。
+_JOB_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=4, thread_name_prefix="research-job"
+)
 
 _DASHBOARD_HTML = (
     Path(__file__).parent / "templates" / "dashboard.html"
@@ -42,8 +47,8 @@ _DASHBOARD_HTML = (
 
 
 class ResearchRequest(BaseModel):
-    query: str
-    mode: str = "web"  # web | local | hybrid
+    query: str = Field(max_length=2000)
+    mode: Literal["web", "local", "hybrid"] = "web"
 
 
 class ResearchResponse(BaseModel):
@@ -141,7 +146,10 @@ def _run_job(job_id: str, query: str, mode: str) -> None:
         cur_self_heal = 0
         cur_memory_writes = 0
 
-        for chunk in graph.stream(inputs, stream_mode="updates", config={"callbacks": callbacks}):
+        # 每个任务取一份独立回调，避免并发线程共享 handler 造成 trace 串扰
+        job_callbacks = get_callbacks()
+
+        for chunk in graph.stream(inputs, stream_mode="updates", config={"callbacks": job_callbacks}):
             node = next(iter(chunk.keys()))
             patch = chunk[node] or {}
             if node in _NODE_TO_STAGE:
@@ -227,21 +235,47 @@ def research(req: ResearchRequest):
 @app.post("/research/job")
 def research_job(req: ResearchRequest):
     job = store.create(req.query, req.mode, _config_snapshot())
-    threading.Thread(target=_run_job, args=(job.id, req.query, req.mode), daemon=True).start()
+    _JOB_EXECUTOR.submit(_run_job, job.id, req.query, req.mode)
     return {"job_id": job.id, "dashboard_url": f"/dashboard?job={job.id}"}
 
 
 @app.get("/api/jobs")
 def list_jobs():
-    return [j.to_dict() for j in store.list()]
+    # 轻量 DTO：dashboard 高频轮询，不回传 report/analysis/sources 等大字段。
+    return [
+        {
+            "id": j.id,
+            "query": j.query,
+            "mode": j.mode,
+            "status": j.status,
+            "stage_index": j.stage_index,
+            "progress": j.progress,
+            "created_at": j.created_at,
+            "updated_at": j.updated_at,
+            "error": j.error,
+            "source_count": len(j.sources),
+            "metrics": {
+                k: j.metrics.get(k)
+                for k in (
+                    "task_completion_rate",
+                    "citation_accuracy",
+                    "hallucination_rate",
+                    "citation_recall",
+                    "sources_total",
+                )
+                if k in j.metrics
+            },
+        }
+        for j in store.list()
+    ]
 
 
 @app.get("/api/jobs/{job_id}")
 def get_job(job_id: str):
-    job = store.get(job_id)
-    if job is None:
+    snap = store.snapshot(job_id)
+    if snap is None:
         raise HTTPException(status_code=404, detail="job not found")
-    return job.to_dict()
+    return snap
 
 
 @app.get("/", response_class=HTMLResponse)

@@ -54,7 +54,10 @@ def evaluate(state: ResearchState) -> EvalResult:
     else:
         # 未显式引用 URL：视为无虚假引用，精度满分（真实模型下会反映真实引用）
         citation_accuracy = 1.0
-    referenced = sum(1 for s in sources if (s.url in report or s.title in report))
+    # 注意：Source.title 默认为 ""，空串 in report 恒为 True，会虚高召回、压低幻觉率，故需先判非空
+    referenced = sum(
+        1 for s in sources if (s.url and s.url in report) or (s.title and s.title in report)
+    )
     citation_recall = round(referenced / len(sources), 3) if sources else 1.0
 
     # 3) 幻觉率（启发式代理）：未被报告引用的检索来源占比

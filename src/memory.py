@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import datetime
 import hashlib
+import logging
 import os
 import sqlite3
 import threading
@@ -22,6 +23,8 @@ from typing import Any
 
 from .config import settings
 from .rag.embeddings import ChromaEmbeddingFunction, Embedder, cosine
+
+logger = logging.getLogger(__name__)
 
 # 离线防御：Chroma 初始化用守护线程 + 超时探测包裹（与 rag/store.py 同源思路，独立探针缓存）
 _MEM_PROBE: bool | None = None
@@ -110,8 +113,8 @@ class SemanticIndex:
                 col.query(query_texts=["probe"], n_results=1)
                 col.delete(ids=["__probe__"])
                 box["col"] = col
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("Chroma 长记忆初始化失败，将降级内存索引：%s", exc)
 
         t = threading.Thread(target=_init, daemon=True)
         t.start()
@@ -142,8 +145,9 @@ class SemanticIndex:
                     metadatas=[{**(metadata or {}), "id": _id}],
                 )
                 return
-            except Exception:
-                pass  # Chroma 运行期失败则降级内存
+            except Exception as exc:
+                # Chroma 运行期失败则降级内存
+                logger.warning("Chroma 写入失败，降级内存索引：%s", exc)
         # 内存余弦兜底
         self._mem[_id] = (self.embedder.embed(text), text, metadata or {})
 
@@ -155,8 +159,8 @@ class SemanticIndex:
                 res = self._col.query(query_texts=[query], n_results=top_n)
                 docs = (res.get("documents") or [[]])[0]
                 return [d for d in docs if d]
-            except Exception:
-                pass  # 降级内存
+            except Exception as exc:
+                logger.warning("Chroma 检索失败，降级内存余弦召回：%s", exc)
         q = self.embedder.embed(query)
         ranked = sorted(
             self._mem.values(),
@@ -194,6 +198,9 @@ class MemoryStore:
 
     - save：落库报告并抽取洞察写入语义索引（幂等）；
     - recall：语义召回优先，无命中时回退关键词召回（向后兼容）。
+
+    语义索引惰性构建：`SemanticIndex()` 内含最长 6s 的 Chroma 探测，若在 __init__ 里建，
+    则 `import src.server` 等任何一次导入都要付这份成本；改为首次 save/recall 访问时才建。
     """
 
     def __init__(
@@ -204,8 +211,19 @@ class MemoryStore:
         self.path = path or settings.memory_db_path
         self.enabled = settings.memory_enabled
         self._init_db()
-        self.index = semantic or SemanticIndex()
+        self._index: SemanticIndex | None = semantic
         self.last_recall: list[str] = []
+
+    @property
+    def index(self) -> SemanticIndex:
+        """惰性语义索引：首次访问时才构建（含 Chroma 探测），之后复用。"""
+        if self._index is None:
+            self._index = SemanticIndex()
+        return self._index
+
+    @index.setter
+    def index(self, value: SemanticIndex) -> None:
+        self._index = value
 
     def _init_db(self) -> None:
         if os.path.dirname(self.path):

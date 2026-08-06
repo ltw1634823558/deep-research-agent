@@ -6,10 +6,13 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 
 from ..config import settings
 from .embeddings import Embedder, cosine
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -34,23 +37,47 @@ class Reranker:
         self.embedder = embedder or Embedder()
 
     def rerank(
-        self, query: str, docs: list[RankedDoc], top_n: int | None = None
+        self,
+        query: str,
+        docs: list[RankedDoc],
+        top_n: int | None = None,
+        *,
+        emb_lookup: dict | None = None,
     ) -> list[RankedDoc]:
+        """精排候选集。
+
+        `emb_lookup`（可选）：以 `RankedDoc.id` 为键的文档向量缓存，由调用方复用已算好的
+        向量，避免 mock 精排重复调用 embedding（openai provider 下即重复 HTTP 请求）。
+        """
         if self.provider == "cohere" and self.cohere_api_key:
             try:
                 return self._cohere_rerank(query, docs, top_n)
-            except Exception:
-                pass  # 降级 mock
-        return self._mock_rerank(query, docs, top_n)
+            except Exception as e:  # 降级 mock
+                logger.warning(
+                    "rerank: Cohere Rerank 调用失败，降级 mock 混合打分：%s", e, exc_info=False
+                )
+        return self._mock_rerank(query, docs, top_n, emb_lookup=emb_lookup)
 
-    def _mock_rerank(self, query: str, docs: list[RankedDoc], top_n: int | None) -> list[RankedDoc]:
+    def _mock_rerank(
+        self,
+        query: str,
+        docs: list[RankedDoc],
+        top_n: int | None,
+        *,
+        emb_lookup: dict | None = None,
+    ) -> list[RankedDoc]:
         if not docs:
             return []
         q_emb = self.embedder.embed(query)
         q_tokens = set(query.lower().split())
         scored: list[RankedDoc] = []
         for d in docs:
-            sem = max(cosine(q_emb, self.embedder.embed(d.text)), 0.0)
+            d_emb = (
+                emb_lookup[d.id]
+                if emb_lookup is not None and d.id in emb_lookup
+                else self.embedder.embed(d.text)
+            )
+            sem = max(cosine(q_emb, d_emb), 0.0)
             d_tokens = set(d.text.lower().split())
             overlap = len(q_tokens & d_tokens) / (len(q_tokens | d_tokens) or 1)
             hybrid = 0.6 * sem + 0.4 * overlap

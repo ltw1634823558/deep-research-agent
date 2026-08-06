@@ -11,6 +11,7 @@ Chroma 在离线环境会尝试连接远端遥测而阻塞，因此用守护线�
 
 from __future__ import annotations
 
+import logging
 import threading
 import uuid
 from dataclasses import dataclass, field
@@ -20,6 +21,8 @@ from ..config import settings
 from ..state import Source
 from .embeddings import ChromaEmbeddingFunction, Embedder, cosine
 from .rerank import RankedDoc, Reranker
+
+logger = logging.getLogger(__name__)
 
 _CHROMA_TIMEOUT = 6.0
 _CHROMA_PROBE: bool | None = None  # 模块级缓存：避免重复触发离线阻塞
@@ -79,8 +82,12 @@ class ChromaRAGStore:
                 col.query(query_texts=["probe"], n_results=1)
                 col.delete(ids=["__probe__"])
                 box["col"] = col
-            except Exception:
-                pass
+            except Exception as e:  # 降级内存向量库
+                logger.warning(
+                    "chroma: 初始化/探针失败（可能离线或网络受限），将降级内存向量库：%s",
+                    e,
+                    exc_info=False,
+                )
 
         t = threading.Thread(target=_init, daemon=True)
         t.start()
@@ -120,18 +127,24 @@ class ChromaRAGStore:
         k = top_k or settings.rag_top_k
         if not self._docs:
             return []
+        emb_lookup: dict[str, list[float]] | None = None
         if self._use_chroma:
             n = min(k, len(self._docs))
             res = self._collection.query(query_texts=[query], n_results=n)
             ids = (res.get("ids") or [[]])[0]
             docs = [self._docs[i] for i in ids if i in self._docs]
         else:
+            # 向量只算一次：query 1 次 + 全量文档 1 次批量，随后召回排序与精排共享，
+            # 避免「排序 N 次 + 精排 N 次」的重复 embedding 调用。
+            all_docs = list(self._docs.values())
             q_emb = self.embedder.embed(query)
+            doc_embs = self.embedder.embed_batch([d.text for d in all_docs])
+            emb_lookup = {d.id: e for d, e in zip(all_docs, doc_embs, strict=True)}
             ranked = sorted(
-                self._docs.values(),
-                key=lambda d: cosine(q_emb, self.embedder.embed(d.text)),
+                all_docs,
+                key=lambda d: cosine(q_emb, emb_lookup[d.id]),
                 reverse=True,
             )
             docs = ranked[:k]
         base = [RankedDoc(id=d.id, text=d.text, score=0.0, metadata=d.metadata) for d in docs]
-        return self.reranker.rerank(query, base, top_n=rerank_top_n or k)
+        return self.reranker.rerank(query, base, top_n=rerank_top_n or k, emb_lookup=emb_lookup)
