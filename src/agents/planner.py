@@ -7,8 +7,7 @@ import json
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableConfig
 
-from ..config import get_llm
-from ..observability import callbacks
+from ..config import get_llm, resolve_settings
 from ..state import ResearchState, Subtopic
 
 
@@ -30,12 +29,14 @@ def _parse_plan(raw: str, query: str) -> list[Subtopic]:
 
 
 def planner_node(state: ResearchState, config: RunnableConfig) -> dict:
-    llm = get_llm()
+    llm = get_llm(resolve_settings(config))
     prompt = (
         f"你是一个研究规划智能体。请把研究问题拆解为 3-5 个可独立检索的子主题，"
         f"直接返回一个 JSON 字符串数组，不要其他内容。\n研究问题：{state['query']}"
     )
-    raw = llm.invoke(prompt, config={"callbacks": callbacks}).content
+    # 转发节点自身的 RunnableConfig（含本次任务专属 callbacks），
+    # 不再用模块级全局 callbacks 覆盖，避免并发任务 trace 串扰。
+    raw = llm.invoke(prompt, config=config).content
     plan = _parse_plan(raw, state["query"])
     return {
         "plan": plan,
