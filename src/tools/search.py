@@ -9,8 +9,9 @@
 from __future__ import annotations
 
 import logging
+from typing import Optional
 
-from ..config import settings
+from ..config import Settings, settings
 from ..mcp.client import search_via_mcp
 from ..state import Source
 
@@ -29,9 +30,13 @@ def _mock_search(query: str, top_k: int) -> list[Source]:
     ]
 
 
-def web_search(query: str, top_k: int = 5) -> list[Source]:
-    """直连 Tavily；配置了 key 则必须真实联网，失败直接抛异常，不再静默 mock。"""
-    key = settings.tavily_api_key.strip()
+def web_search(query: str, top_k: int = 5, settings_obj: Optional["Settings"] = None) -> list[Source]:
+    """直连 Tavily；配置了 key 则必须真实联网，失败直接抛异常，不再静默 mock。
+
+    settings_obj 透传按请求配置（per-request key/provider），未传则回落全局单例。
+    """
+    s = settings_obj or settings
+    key = s.tavily_api_key.strip()
     if not key:
         logger.info("未配置 TAVILY_API_KEY，使用离线 mock 检索结果（非真实联网）。")
         return _mock_search(query, top_k)
@@ -63,9 +68,13 @@ def web_search(query: str, top_k: int = 5) -> list[Source]:
         raise
 
 
-def search(query: str, top_k: int = 5) -> list[Source]:
-    """统一检索入口：按 search_provider 路由到 Tavily 直连或 MCP Server。"""
-    if settings.search_provider == "mcp":
-        return search_via_mcp(query, max_results=top_k)
-    return web_search(query, top_k)
+def search(query: str, top_k: int = 5, settings_obj: Optional["Settings"] = None) -> list[Source]:
+    """统一检索入口：按 search_provider 路由到 Tavily 直连或 MCP Server。
+
+    settings_obj 透传按请求配置，使 per-request search_provider / key 真正生效。
+    """
+    s = settings_obj or settings
+    if s.search_provider == "mcp":
+        return search_via_mcp(query, max_results=top_k, settings_obj=s)
+    return web_search(query, top_k, settings_obj=s)
 

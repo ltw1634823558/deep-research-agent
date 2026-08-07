@@ -11,6 +11,9 @@
 from __future__ import annotations
 
 import concurrent.futures
+import logging
+import threading
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal, cast
 
@@ -30,16 +33,95 @@ from .evaluation import evaluate
 from .graph import build_graph
 from .jobs import STAGES, JobStatus, _to_sources, _to_subtopics, store
 from .memory import memory_store
-from .observability import get_callbacks
+from .observability import get_callbacks, shutdown_all_clients
 from .state import ResearchState, _add_sources, initial_state
 
-app = FastAPI(title="Deep Research Agent API", version="1.0.0")
+logger = logging.getLogger(__name__)
+
+# 收到 SIGTERM 后留给在途研究任务的收尾时间。设得比编排层的
+# terminationGracePeriod（K8s 默认 30s）短，确保我们能在被 SIGKILL 前
+# 主动 flush 追踪数据，而不是把宽限期全耗在等 job 上。
+_SHUTDOWN_GRACE = 20.0
+
+
+def _shutdown_resources() -> None:
+    """进程退出前有序释放资源。任一步失败都不阻断后续步骤。
+
+    顺序不可调换：先让在途 job 收尾（它们仍在产生 span），再 flush 追踪，
+    最后才关长记忆句柄——反过来会让最后一批 trace 和记忆写入一起丢。
+    """
+    # 1) 停止接新活并取消排队任务，给在途 job 一个「有界」的完成窗口。
+    #    ThreadPoolExecutor.shutdown 不支持 timeout，故用 daemon 线程 join 限时；
+    #    否则一个跑几分钟的 job 会拖到编排层 SIGKILL，数据丢得更彻底。
+    try:
+        _JOB_EXECUTOR.shutdown(wait=False, cancel_futures=True)
+        waiter = threading.Thread(
+            target=_JOB_EXECUTOR.shutdown, kwargs={"wait": True}, daemon=True
+        )
+        waiter.start()
+        waiter.join(_SHUTDOWN_GRACE)
+        if waiter.is_alive():
+            logger.warning(
+                "后台研究任务未在 %.0fs 内收尾，继续关闭其余资源", _SHUTDOWN_GRACE
+            )
+    except Exception:
+        logger.exception("关闭后台任务线程池失败")
+
+    # 2) flush 追踪：LangFuse 的 OTel 批处理器攒批异步上报，不 flush 就会丢最后一批
+    try:
+        shutdown_all_clients()
+    except Exception:
+        logger.exception("关闭 LangFuse 客户端失败")
+
+    # 3) 收长记忆：SQLite 连接与 Chroma 索引句柄（Windows 下不关会锁住文件）
+    try:
+        memory_store.close()
+    except Exception:
+        logger.exception("关闭长记忆存储失败")
+
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    yield
+    _shutdown_resources()
+
+
+app = FastAPI(title="Deep Research Agent API", version="1.0.0", lifespan=_lifespan)
 graph = build_graph()
 
+# 启动预热：首次访问长记忆索引会触发最长 6s 的 Chroma 探测，提前在导入期完成，
+# 避免首个请求线程被阻塞（使用独立 index 锁，不阻塞 SQLite 读写，见 L-3/L-4）。
+try:
+    _ = memory_store.index.backend
+except Exception:
+    pass
+
 # 后台任务并发上限：避免每个请求裸起线程压垮进程 / 打爆下游 API 配额。
+_JOB_WORKERS = 4
 _JOB_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
-    max_workers=4, thread_name_prefix="research-job"
+    max_workers=_JOB_WORKERS, thread_name_prefix="research-job"
 )
+# ThreadPoolExecutor 的队列是无界的：密集 POST /research/job 会让排队闭包无限堆积，
+# 而 JobStore 只留最近 50 条，早期 job 记录已被 LRU 淘汰、结果无处可查（静默丢失）。
+# 这里显式限制在途任务数，超出直接 429，让调用方可感知并退避。
+_JOB_QUEUE_LIMIT = 32
+_inflight_jobs = 0
+_inflight_lock = threading.Lock()
+
+
+def _release_job_slot(_fut=None) -> None:
+    global _inflight_jobs
+    with _inflight_lock:
+        _inflight_jobs = max(0, _inflight_jobs - 1)
+
+
+def _acquire_job_slot() -> bool:
+    global _inflight_jobs
+    with _inflight_lock:
+        if _inflight_jobs >= _JOB_QUEUE_LIMIT:
+            return False
+        _inflight_jobs += 1
+        return True
 
 _DASHBOARD_HTML = (
     Path(__file__).parent / "templates" / "dashboard.html"
@@ -63,20 +145,37 @@ class ResearchResponse(BaseModel):
 _NODE_TO_STAGE = {"planner": 1, "researcher": 1, "analyst": 2, "writer": 3}
 
 
-def _config_snapshot() -> dict:
+def _public_error(exc: BaseException) -> str:
+    """对外错误摘要：只回异常类型 + 短句，绝不回原始文本。
+
+    `GET /api/jobs/{id}` 目前无鉴权，异常原文常带绝对路径、上游 API 的
+    key 相关提示、内网地址等，直接回显等于信息泄露。全文只进服务端日志。
+    """
+    name = type(exc).__name__
+    known = {
+        "RuntimeError": "研究流程执行失败",
+        "TimeoutError": "外部依赖响应超时",
+        "ValueError": "输入或配置不合法",
+        "ConnectionError": "外部服务连接失败",
+    }
+    return f"{known.get(name, '研究任务执行异常')}（{name}），详情见服务端日志"
+
+
+def _config_snapshot(cfg: "Settings | None" = None) -> dict:
+    s = cfg or settings
     return {
-        "llm_provider": settings.llm_provider,
-        "search_provider": settings.search_provider,
-        "embedding_provider": settings.embedding_provider,
-        "rerank_provider": settings.rerank_provider,
-        "rag_backend": settings.rag_backend,
-        "rag_top_k": settings.rag_top_k,
-        "research_mode": settings.research_mode,
-        "memory_enabled": settings.memory_enabled,
+        "llm_provider": s.llm_provider,
+        "search_provider": s.search_provider,
+        "embedding_provider": s.embedding_provider,
+        "rerank_provider": s.rerank_provider,
+        "rag_backend": s.rag_backend,
+        "rag_top_k": s.rag_top_k,
+        "research_mode": s.research_mode,
+        "memory_enabled": s.memory_enabled,
         "memory_backend": memory_store.index.backend,
-        "memory_top_k": settings.memory_top_k,
-        "analyst_self_heal": settings.analyst_self_heal,
-        "langfuse": bool(settings.langfuse_public_key and settings.langfuse_secret_key),
+        "memory_top_k": s.memory_top_k,
+        "analyst_self_heal": s.analyst_self_heal,
+        "langfuse": bool(s.langfuse_public_key and s.langfuse_secret_key),
     }
 
 
@@ -91,8 +190,15 @@ def _finalize_job(
     memory_recall: list[str] | None = None,
     memory_writes: int = 0,
     analyst_self_heal: int = 0,
+    cfg: "Settings | None" = None,
 ) -> None:
-    """计算评估指标并落库，标记任务完成。"""
+    """计算评估指标并落库，标记任务完成。
+
+    `cfg` 为按请求注入的配置；缺省回落到全局 `settings`，保证与 `_run_job` 中
+    `graph.stream` 使用的是同一份参数（否则异步 job 的 max_iterations / langfuse_url
+    会读到全局值，多租户覆写失效）。
+    """
+    s = cfg or settings
     state = cast(
         ResearchState,
         {
@@ -103,7 +209,7 @@ def _finalize_job(
             "report": report,
             "sources": sources,
             "iteration": 0,
-            "max_iterations": settings.max_research_iterations,
+            "max_iterations": s.max_research_iterations,
             "mode": mode,
             "messages": [],
             "memory_recall": memory_recall or [],
@@ -111,8 +217,8 @@ def _finalize_job(
             "memory_writes": memory_writes,
         },
     )
-    metrics = evaluate(state).to_dict()
-    langfuse_url = settings.langfuse_host if (settings.langfuse_public_key and settings.langfuse_secret_key) else ""
+    metrics = evaluate(state, s).to_dict()
+    langfuse_url = s.langfuse_host if (s.langfuse_public_key and s.langfuse_secret_key) else ""
     store.update(
         job_id,
         status=JobStatus.DONE.value,
@@ -152,7 +258,7 @@ def _run_job(job_id: str, query: str, mode: str, cfg: Settings) -> None:
         cur_memory_writes = 0
 
         # 每个任务取一份独立回调，避免并发线程共享 handler 造成 trace 串扰
-        job_callbacks = get_callbacks()
+        job_callbacks = get_callbacks(cfg)
 
         for chunk in graph.stream(
             inputs,
@@ -198,9 +304,11 @@ def _run_job(job_id: str, query: str, mode: str, cfg: Settings) -> None:
             memory_recall=cur_memory_recall,
             memory_writes=cur_memory_writes,
             analyst_self_heal=cur_self_heal,
+            cfg=cfg,
         )
-    except Exception as exc:  # 不吞掉，记录到任务以便前端展示
-        store.update(job_id, status=JobStatus.ERROR.value, error=str(exc)[:500])
+    except Exception as exc:  # 不吞掉：全文进服务端日志，对外只暴露脱敏摘要
+        logger.exception("研究任务 %s 执行失败", job_id)
+        store.update(job_id, status=JobStatus.ERROR.value, error=_public_error(exc))
 
 
 @app.get("/health")
@@ -211,12 +319,13 @@ def health():
 @app.post("/research", response_model=ResearchResponse)
 def research(req: ResearchRequest, cfg: Settings = Depends(get_settings)):
     state = initial_state(req.query, cfg.max_research_iterations, mode=req.mode)
-    result = graph.invoke(state, config={"configurable": {"settings": cfg}})
-    metrics = evaluate(result).to_dict()
+    # 同步运行也取独立回调，保证 trace 不串扰（L-F）
+    result = graph.invoke(state, config={"configurable": {"settings": cfg}, "callbacks": get_callbacks(cfg)})
+    metrics = evaluate(result, cfg).to_dict()
 
     # 同步运行也记入 JobStore，供 dashboard 看历史
-    job = store.create(req.query, req.mode, _config_snapshot())
-    langfuse_url = settings.langfuse_host if (settings.langfuse_public_key and settings.langfuse_secret_key) else ""
+    job = store.create(req.query, req.mode, _config_snapshot(cfg))
+    langfuse_url = cfg.langfuse_host if (cfg.langfuse_public_key and cfg.langfuse_secret_key) else ""
     store.update(
         job.id,
         status=JobStatus.DONE.value,
@@ -245,8 +354,18 @@ def research(req: ResearchRequest, cfg: Settings = Depends(get_settings)):
 
 @app.post("/research/job")
 def research_job(req: ResearchRequest, cfg: Settings = Depends(get_settings)):
-    job = store.create(req.query, req.mode, _config_snapshot())
-    _JOB_EXECUTOR.submit(_run_job, job.id, req.query, req.mode, cfg)
+    if not _acquire_job_slot():
+        raise HTTPException(
+            status_code=429,
+            detail=f"研究任务排队已满（在途上限 {_JOB_QUEUE_LIMIT}），请稍后重试",
+        )
+    try:
+        job = store.create(req.query, req.mode, _config_snapshot(cfg))
+        future = _JOB_EXECUTOR.submit(_run_job, job.id, req.query, req.mode, cfg)
+    except Exception:
+        _release_job_slot()
+        raise
+    future.add_done_callback(_release_job_slot)
     return {"job_id": job.id, "dashboard_url": f"/dashboard?job={job.id}"}
 
 

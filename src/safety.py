@@ -18,9 +18,24 @@ UNTRUSTED_GUARD = (
 )
 
 
+def _escape_delimiters(text: str) -> str:
+    """转义 < 和 >：防止外部内容伪造 `<<外部内容>>` / `<</外部内容>>` 闭合标签，
+    从而逃逸护栏约束。
+
+    原理：包裹后的开/闭标签是我们用字面量 `<` 生成的；若外部内容里出现 `<<` 或 `<</`
+    就能提前闭合区块、让后续文本脱离护栏。把内容里的 `<`/`>` 转义为 `&lt;`/`&gt;` 后，
+    外部数据再也拼不出字面量 `<`，结构保证「区块内全是转义后的数据，区块外只有固定护栏」。
+    LLM 读取转义文本不受影响（仍是可读文本）。
+    """
+    return text.replace("<", "&lt;").replace(">", "&gt;")
+
+
 def wrap_untrusted(label: str, content: str) -> str:
     """把不可信内容用显式分隔符包裹，并附带护栏说明。
 
     label 描述来源类型（如 "web检索" / "历史记忆"），便于模型理解上下文。
+    内容（含 label）一律转义 `<`/`>`，阻断伪造分隔符闭合的注入绕过。
     """
-    return f"<<外部内容 类型={label}>>\n{content}\n<</外部内容>>"
+    safe_label = _escape_delimiters(label)
+    safe_content = _escape_delimiters(content)
+    return f"<<外部内容 类型={safe_label}>>\n{safe_content}\n<</外部内容>>"

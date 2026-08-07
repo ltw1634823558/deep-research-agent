@@ -15,6 +15,7 @@ from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableConfig
 
 from ..config import get_llm, resolve_settings
+from ..safety import UNTRUSTED_GUARD, wrap_untrusted
 from ..state import Finding, ResearchState, Subtopic
 
 # 低置信 / 不确定表述标记（命中即视为分析不可靠，需要修补或补充检索）
@@ -59,10 +60,13 @@ def analyst_node(state: ResearchState, config: RunnableConfig) -> dict:
     cfg = resolve_settings(config)
     llm = get_llm(cfg)
     findings_text = "\n".join(f"[{f.subtopic_id}] {f.summary}" for f in state["findings"])
+    # 发现源自被外部网页污染的检索摘要，属不可信数据，用分隔符包裹（含转义）+ 护栏阻断注入，
+    # 与 writer 节点保持一致的防御口径。
+    findings_block = wrap_untrusted("研究发现", findings_text)
     base_prompt = (
         "你是一个研究核验智能体。请分析以下各子主题的发现，"
         "判断是否一致、是否有明显缺口需要补充检索。\n"
-        f"发现：\n{findings_text}"
+        f"发现：\n{findings_block}\n\n{UNTRUSTED_GUARD}"
     )
     # 直接透传节点自身的 RunnableConfig：其中已带本次任务专属的 callbacks，
     # 不能再用模块级全局 callbacks 覆盖，否则并发任务的 trace 会串到同一个 handler。

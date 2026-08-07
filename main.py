@@ -21,6 +21,7 @@ except Exception:
 from src.config import settings  # noqa: E402
 from src.evaluation import evaluate  # noqa: E402
 from src.graph import build_graph  # noqa: E402
+from src.observability import get_callbacks  # noqa: E402
 from src.state import initial_state  # noqa: E402
 
 
@@ -37,7 +38,12 @@ def main() -> None:
     args = parser.parse_args()
 
     graph = build_graph()
-    result = graph.invoke(initial_state(args.query, args.iterations, mode=args.mode))
+    # 与 server 侧行为对齐：CLI 同样注入 settings 与 LangFuse 回调，
+    # 否则配置了 LangFuse 也拿不到任何 CLI 运行的 trace。
+    result = graph.invoke(
+        initial_state(args.query, args.iterations, mode=args.mode),
+        config={"configurable": {"settings": settings}, "callbacks": get_callbacks()},
+    )
 
     print(f"\n===== RESEARCH REPORT (mode={args.mode}) =====\n")
     print(result.get("report", ""))
@@ -46,7 +52,7 @@ def main() -> None:
         print(f"- [{getattr(s, 'source_type', 'web')}] {s.title}: {s.url}")
 
     print("\n===== EVALUATION (任务完成率/引用准确率/幻觉率) =====\n")
-    print(json.dumps(evaluate(result).to_dict(), ensure_ascii=False, indent=2))
+    print(json.dumps(evaluate(result, settings).to_dict(), ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

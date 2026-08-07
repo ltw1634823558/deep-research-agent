@@ -47,6 +47,27 @@ def _add_sources(existing: list[Source] | None, new: list[Source] | None) -> lis
     return merged
 
 
+def _add_messages_windowed(
+    existing: list[BaseMessage] | None, new: list[BaseMessage] | None
+) -> list[BaseMessage]:
+    """messages 归并 reducer：先用官方 `add_messages`（按 id 去重/覆盖），再截留最近 N 条。
+
+    N 取 `settings.research_window`。此前该配置项在 `.env.example` 中被公开为可调旋钮，
+    但代码里无人读取——等于对使用者撒谎，且 researcher 的迭代回路每个子主题都会追加
+    一条消息，长任务下 messages 会无界增长。这里让它真正生效：<=0 表示不限制。
+
+    reducer 由 LangGraph 在图内部调用，拿不到 per-request config，故读全局 settings——
+    这是结构性上限，不属于按租户覆写的参数。
+    """
+    merged = add_messages(existing or [], new or [])
+    from .config import settings as _settings  # 延迟导入，避免 state <-> config 循环依赖
+
+    window = getattr(_settings, "research_window", 0) or 0
+    if window > 0 and len(merged) > window:
+        return list(merged[-window:])
+    return merged
+
+
 class ResearchState(TypedDict):
     query: str
     plan: list[Subtopic]
@@ -57,7 +78,7 @@ class ResearchState(TypedDict):
     iteration: int
     max_iterations: int
     mode: str  # web | local | hybrid（研究模式，决定检索来源）
-    messages: Annotated[list[BaseMessage], add_messages]
+    messages: Annotated[list[BaseMessage], _add_messages_windowed]
     # 长记忆：本轮各子主题召回到的历史洞察（供 dashboard 展示，累加）
     memory_recall: Annotated[list[str], add]
     # Analyst 自愈回路实际尝试次数（仅真实 LLM 触发）

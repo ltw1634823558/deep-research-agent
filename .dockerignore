@@ -1,0 +1,24 @@
+# 密钥与本地环境：绝不能打进镜像层
+.env
+.env.*
+.venv/
+venv/
+
+# 运行期生成的数据库与向量索引
+memory.db
+*.db
+.memory_store/
+
+# Python 缓存与测试产物
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# 版本控制与编辑器
+.git/
+.gitignore
+.idea/
+.vscode/
+
+# 本仓库的本地审查报告（非运行时必需）
+code-review*.md

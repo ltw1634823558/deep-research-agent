@@ -16,7 +16,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from ..config import settings
+from ..config import Settings, settings
 from ..state import Source
 
 # ---------- 轻量解析（不依赖 yaml，避免引入重依赖）----------
@@ -199,16 +199,17 @@ class ObsidianVault:
         self._build_links()
 
 
-# 模块级惰性单例：首次真正检索笔记时才扫描用户仓库（import 时不做整库 rglob），
-# 仓库无效则降级合成仓库。
-_vault: ObsidianVault | None = None
+# 模块级惰性缓存：按仓库路径缓存 ObsidianVault 单例（首次真正检索时才扫描用户仓库，
+# 仓库无效则降级合成仓库）。per-request 的 obsidian_vault_path 变化时命中不同缓存项。
+_vaults: dict[str, ObsidianVault] = {}
 
 
-def _get_vault() -> ObsidianVault:
-    global _vault
-    if _vault is None:
-        _vault = ObsidianVault(settings.obsidian_vault_path or None)
-    return _vault
+def _get_vault(settings_obj: "Settings | None" = None) -> ObsidianVault:
+    s = settings_obj or settings
+    path = s.obsidian_vault_path or None
+    if path not in _vaults:
+        _vaults[path] = ObsidianVault(path)
+    return _vaults[path]
 
 
 def __getattr__(name: str) -> object:
@@ -218,6 +219,11 @@ def __getattr__(name: str) -> object:
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-def obsidian_search(query: str, top_k: int = 5, use_graph: bool = True) -> list[Source]:
-    """对上层透明的 Obsidian 检索入口；无仓库时返回合成结果，保证离线可跑、可测。"""
-    return _get_vault().retrieve(query, top_k=top_k, use_graph=use_graph)
+def obsidian_search(
+    query: str, top_k: int = 5, use_graph: bool = True, settings_obj: "Settings | None" = None
+) -> list[Source]:
+    """对上层透明的 Obsidian 检索入口；无仓库时返回合成结果，保证离线可跑、可测。
+
+    settings_obj 透传按请求配置（per-request obsidian_vault_path），未传回落全局。
+    """
+    return _get_vault(settings_obj).retrieve(query, top_k=top_k, use_graph=use_graph)

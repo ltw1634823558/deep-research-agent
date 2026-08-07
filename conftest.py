@@ -12,18 +12,42 @@
 """
 import os
 import tempfile
+import uuid
+import warnings
+
+# 每会话唯一的临时 SQLite 路径：避免不同测试运行之间共享同一 memory.db 造成数据累积/串扰。
+_DB_PATH = os.path.join(
+    tempfile.gettempdir(), f"dra_test_memory_{os.getpid()}_{uuid.uuid4().hex[:8]}.db"
+)
 
 os.environ.setdefault("LLM_PROVIDER", "mock")
 os.environ["RAG_BACKEND"] = "memory"
 os.environ["MEMORY_BACKEND"] = "memory"
-os.environ["MEMORY_DB_PATH"] = os.path.join(tempfile.gettempdir(), "dra_test_memory.db")
+os.environ["MEMORY_DB_PATH"] = _DB_PATH
 os.environ["TAVILY_API_KEY"] = ""
 
 import pytest
 
 import src.config as _cfg
+from src.memory import memory_store
 
 _cfg.settings.tavily_api_key = ""
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _cleanup_memory_db():
+    """会话结束后先关闭长记忆 SQLite 连接，再清理临时 memory.db，避免跨运行残留与文件锁泄漏。"""
+    yield
+    try:
+        memory_store.close()
+    except Exception:  # noqa: BLE001 - 清理阶段不应中断
+        pass
+    try:
+        if os.path.exists(_DB_PATH):
+            os.remove(_DB_PATH)
+    except OSError as exc:
+        # 不再静默吞掉：暴露清理失败，便于发现文件锁/路径问题
+        warnings.warn(f"临时 memory.db 清理失败（可能被占用）：{exc}")
 
 
 @pytest.fixture(autouse=True)

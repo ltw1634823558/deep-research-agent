@@ -17,7 +17,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
-from ..config import settings
+from ..config import Settings, settings
 from ..state import Source
 from .embeddings import ChromaEmbeddingFunction, Embedder, cosine
 from .rerank import RankedDoc, Reranker
@@ -44,16 +44,29 @@ class ChromaRAGStore:
         reranker: Reranker | None = None,
         collection: str | None = None,
         backend: str | None = None,
+        settings_obj: "Settings | None" = None,
     ) -> None:
-        self.embedder = embedder or Embedder()
-        self.reranker = reranker or Reranker(embedder=self.embedder)
+        s = settings_obj or settings
+        # per-request 透传 embedding/rerank provider 与 key，使按请求覆写生效（M2 残余）
+        self.embedder = embedder or Embedder(
+            provider=s.embedding_provider,
+            api_key=s.embedding_api_key,
+            base_url=s.embedding_base_url,
+            model=s.embedding_model,
+        )
+        self.reranker = reranker or Reranker(
+            provider=s.rerank_provider,
+            cohere_api_key=s.cohere_api_key,
+            embedder=self.embedder,
+        )
+        self._settings = s  # 保存按请求解析的 settings，供 retrieve 取 rag_top_k（L-D）
         self._docs: dict[str, RAGDoc] = {}
         self._chroma_client: Any = None
         self._collection: Any = None
         self._collection_name = collection
         self._use_chroma = False
 
-        want = backend or settings.rag_backend
+        want = backend or s.rag_backend
         if want != "memory":
             self._use_chroma = self._try_init_chroma(collection, force=(want == "chroma"))
 
@@ -156,7 +169,7 @@ class ChromaRAGStore:
     def retrieve(
         self, query: str, top_k: int | None = None, rerank_top_n: int | None = None
     ) -> list[RankedDoc]:
-        k = top_k or settings.rag_top_k
+        k = top_k or self._settings.rag_top_k
         if not self._docs:
             return []
         emb_lookup: dict[str, list[float]] | None = None
@@ -180,3 +193,24 @@ class ChromaRAGStore:
             docs = ranked[:k]
         base = [RankedDoc(id=d.id, text=d.text, score=0.0, metadata=d.metadata) for d in docs]
         return self.reranker.rerank(query, base, top_n=rerank_top_n or k, emb_lookup=emb_lookup)
+
+    def close(self) -> None:
+        """释放 ephemeral Chroma collection、client 与 embedder 连接池（M-4 / L-I）。
+
+        内存后端无 Chroma 资源，但 embedder 仍可能持有 httpx 连接池，故一并释放。
+        """
+        if self._use_chroma and self._collection is not None:
+            try:
+                name = self._collection.name
+                if self._chroma_client is not None:
+                    self._chroma_client.delete_collection(name)
+            except Exception as exc:
+                logger.warning("Chroma collection 清理失败（可忽略）：%s", exc)
+            self._collection = None
+            self._chroma_client = None
+        closer = getattr(self.embedder, "close", None)
+        if callable(closer):
+            try:
+                closer()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Embedder 释放失败（已忽略）：%s", exc)

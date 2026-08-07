@@ -1,6 +1,7 @@
 """长短记忆：
 
-- 短期记忆：由 LangGraph 的 messages 通道（带窗口）承载，见 config.research_window。
+- 短期记忆：由 LangGraph 的 messages 通道承载，滑动窗口见 state._add_messages_windowed
+  （窗口大小 = config.research_window，<=0 表示不限制）。
 - 长期记忆：
   - SQLite 持久化历史研究报告（关键词召回，向后兼容）；
   - 叠加【语义长记忆】层——把研究洞察做 Embedding 存入 Chroma（持久化，跨进程/重启保留），
@@ -21,7 +22,7 @@ import sqlite3
 import threading
 from typing import Any
 
-from .config import settings
+from .config import Settings, settings
 from .rag.embeddings import ChromaEmbeddingFunction, Embedder, cosine
 
 logger = logging.getLogger(__name__)
@@ -52,6 +53,7 @@ class SemanticIndex:
         self.path = path or settings.memory_path
         self._mem: dict[str, tuple[list[float], str, dict[str, Any]]] = {}
         self._col: Any = None
+        self._client: Any = None
         self._use_chroma = False
         if self.backend_wanted != "memory":
             self._use_chroma = self._try_init_chroma(force=(self.backend_wanted == "chroma"))
@@ -113,6 +115,7 @@ class SemanticIndex:
                 col.query(query_texts=["probe"], n_results=1)
                 col.delete(ids=["__probe__"])
                 box["col"] = col
+                box["client"] = client
             except Exception as exc:
                 logger.warning("Chroma 长记忆初始化失败，将降级内存索引：%s", exc)
 
@@ -121,6 +124,7 @@ class SemanticIndex:
         t.join(_MEM_TIMEOUT)
         if "col" in box:
             self._col = box["col"]
+            self._client = box.get("client")
             _MEM_PROBE = True
             return True
         _MEM_PROBE = False
@@ -169,6 +173,24 @@ class SemanticIndex:
         )
         return [t[1] for t in ranked[:top_n]]
 
+    def close(self) -> None:
+        """释放 Chroma 连接（PersistentClient 持有的文件锁），降级为内存态。
+
+        供 MemoryStore.close() 调用，确保 Windows 下 .memory_store 目录能被正常清理（L-C）。
+        """
+        if self._col is not None:
+            try:
+                self._col = None
+                # 释放 chromadb 类级共享客户端缓存，真正解除文件锁（L-C）
+                if self._client is not None:
+                    clear = getattr(self._client, "clear_system_cache", None)
+                    if callable(clear):
+                        clear()
+            except Exception as exc:
+                logger.debug("Chroma 长记忆清理失败（可忽略）：%s", exc)
+        self._client = None
+        self._use_chroma = False
+
 
 def _extract_insights(query: str, report: str) -> list[str]:
     """从报告中抽取可用于长期记忆的洞察条目（确定、离线、无 LLM 依赖）。
@@ -213,14 +235,20 @@ class MemoryStore:
         # sqlite 连接延迟到首次 save/recall 才建立（惰性 + 并发安全）。
         self._conn: sqlite3.Connection | None = None
         self._lock = threading.Lock()
+        # index 构建可能触发最长 6s 的 Chroma 探测，独立锁避免阻塞 SQLite 读写（L-3）
+        self._index_lock = threading.Lock()
         self._index: SemanticIndex | None = semantic
-        self.last_recall: list[str] = []
 
     @property
     def index(self) -> SemanticIndex:
-        """惰性语义索引：首次访问时才构建（含 Chroma 探测），之后复用。"""
+        """惰性语义索引：首次访问时才构建（含 Chroma 探测），之后复用。
+
+        加锁双检：全局 memory_store 可能被并发任务共享，避免重复构建 SemanticIndex。
+        """
         if self._index is None:
-            self._index = SemanticIndex()
+            with self._index_lock:
+                if self._index is None:
+                    self._index = SemanticIndex()
         return self._index
 
     @index.setter
@@ -228,28 +256,34 @@ class MemoryStore:
         self._index = value
 
     def _ensure_conn(self) -> None:
-        """惰性建立（且仅一次）sqlite 连接：带 timeout 与跨线程开关，建表幂等。"""
-        if self._conn is None:
-            with self._lock:
-                if self._conn is None:
-                    if os.path.dirname(self.path):
-                        os.makedirs(os.path.dirname(self.path), exist_ok=True)
-                    con = sqlite3.connect(
-                        self.path, timeout=30.0, check_same_thread=False
-                    )
-                    con.execute(
-                        "CREATE TABLE IF NOT EXISTS reports ("
-                        "id INTEGER PRIMARY KEY, query TEXT, report TEXT, ts TEXT)"
-                    )
-                    self._conn = con
+        """惰性建立（且仅一次）sqlite 连接：带 timeout 与跨线程开关，建表幂等。
 
-    def save(self, query: str, report: str) -> int:
-        """落库报告并写入语义索引，返回写入的洞察条数。"""
-        if not settings.memory_enabled:
+        调用方须持有 self._lock（避免在已持锁的 save/recall 中重复加锁导致死锁）。
+        """
+        if self._conn is None:
+            if os.path.dirname(self.path):
+                os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            con = sqlite3.connect(
+                self.path, timeout=30.0, check_same_thread=False
+            )
+            con.execute(
+                "CREATE TABLE IF NOT EXISTS reports ("
+                "id INTEGER PRIMARY KEY, query TEXT, report TEXT, ts TEXT)"
+            )
+            self._conn = con
+
+    def save(self, query: str, report: str, cfg: "Settings | None" = None) -> int:
+        """落库报告并写入语义索引，返回写入的洞察条数。
+
+        cfg 透传按请求配置，使 per-request memory_enabled 真正生效（path/backend 为进程级全局，不随请求变）。
+        """
+        s = cfg or settings
+        if not s.memory_enabled:
             return 0
-        self._ensure_conn()
-        assert self._conn is not None
         with self._lock:
+            self._ensure_conn()
+            if self._conn is None:
+                return 0
             with self._conn:
                 self._conn.execute(
                     "INSERT INTO reports (query, report, ts) VALUES (?, ?, ?)",
@@ -261,24 +295,29 @@ class MemoryStore:
             self.index.add(ins, {"query": query, "kind": "insight"})
         return len(insights)
 
-    def recall(self, query: str, k: int | None = None) -> list[str]:
-        """召回历史记忆：语义优先，无命中回退关键词。返回可注入上下文的字符串列表。"""
-        if not settings.memory_enabled:
+    def recall(self, query: str, k: int | None = None, cfg: "Settings | None" = None) -> list[str]:
+        """召回历史记忆：语义优先，无命中回退关键词。返回可注入上下文的字符串列表。
+
+        cfg 透传按请求配置，使 per-request memory_enabled / memory_top_k 真正生效。
+        """
+        s = cfg or settings
+        if not s.memory_enabled:
             return []
-        k = k or settings.memory_top_k
+        k = k or s.memory_top_k
 
         hits = self.index.search(query, top_n=k)
         if hits:
-            self.last_recall = hits
-            return hits
+            # 两条召回路径都做长度上限，避免过长内容灌入 prompt（L-B）
+            return [h[:2000] for h in hits[:k]]
 
-        # 兜底：SQLite 关键词重叠（向后兼容原有行为）
-        self._ensure_conn()
-        assert self._conn is not None
+        # 兜底：SQLite 关键词重叠（向后兼容原有行为）。加 LIMIT 避免全表扫描撑爆内存（L-2）
         with self._lock:
+            self._ensure_conn()
+            if self._conn is None:
+                return []
             with self._conn:
                 rows = self._conn.execute(
-                    "SELECT query, report FROM reports"
+                    "SELECT query, report FROM reports ORDER BY id DESC LIMIT 500"
                 ).fetchall()
         q_words = set(query.lower().split())
         scored = [
@@ -286,15 +325,20 @@ class MemoryStore:
         ]
         scored = [s for s in scored if s[0] > 0]
         scored.sort(reverse=True)
-        self.last_recall = [report for _, report in scored[:k]]
-        return self.last_recall
+        # 单条内容截断，避免长报告全文灌入 prompt（L-2）
+        return [report[:2000] for _, report in scored[:k]]
 
     def close(self) -> None:
-        """释放 SQLite 连接，便于测试与进程退出时的确定性清理。
+        """释放 SQLite 连接与语义索引，便于测试与进程退出时的确定性清理。
 
         连接为惰性长连接（见 _ensure_conn），不主动关闭会导致 Windows 下
         持有文件锁、临时目录/文件无法删除。
         """
+        with self._index_lock:
+            idx = self._index
+            self._index = None
+            if idx is not None:
+                idx.close()
         with self._lock:
             con = self._conn
             self._conn = None

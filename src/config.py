@@ -15,6 +15,9 @@
 
 from __future__ import annotations
 
+import hashlib
+import threading
+from collections import OrderedDict
 from typing import Any, Optional
 
 from pydantic import field_validator, ValidationInfo
@@ -194,7 +197,18 @@ def get_settings() -> "Settings":
 # 按「配置指纹」缓存已构建的 LLM 客户端（复用 httpx 连接池）。
 # 不能用 lru_cache 直接缓存 Settings 入参：Settings 可变且不可哈希，
 # 且测试/运行时会 mutate 全局单例属性，必须按取值构造稳定 key。
-_LLM_CACHE: dict[tuple, Any] = {}
+#
+# 用有界 LRU + 锁：多租户下 key 空间随租户数增长，无界 dict 会把每个租户的
+# httpx 连接池永久留在内存里；而 job 线程并发调用 get_llm，普通 dict 的
+# 读改写序列虽不至于崩，但会重复建客户端，白白多开连接池。
+_LLM_CACHE_MAXSIZE = 32
+_LLM_CACHE: "OrderedDict[tuple, Any]" = OrderedDict()
+_LLM_CACHE_LOCK = threading.Lock()
+
+
+def _credential_fingerprint(raw: str) -> str:
+    """凭据指纹：进缓存键但不落明文，避免 key 出现在内存快照 / 异常回溯里。"""
+    return hashlib.sha256((raw or "").encode("utf-8")).hexdigest()[:16]
 
 
 def get_llm(s: Optional["Settings"] = None) -> Any:
@@ -209,17 +223,23 @@ def get_llm(s: Optional["Settings"] = None) -> Any:
     has_key = bool(cfg.openai_api_key)
     use_mock = provider == "mock" or not has_key
 
+    # 键里必须放「凭据指纹」而不是 has_key 布尔：否则同 model/base_url 的两个租户
+    # 会命中同一个客户端，租户 B 的请求实际用租户 A 的 api_key 调上游——计费错记、
+    # 配额互打，自建网关下还可能越权。同理，进程内热换 key 也会拿到陈旧客户端。
     key = (
         "mock" if use_mock else provider,
         cfg.model_name,
         cfg.temperature,
         cfg.openai_base_url,
-        has_key,
+        "" if use_mock else _credential_fingerprint(cfg.openai_api_key),
     )
-    cached = _LLM_CACHE.get(key)
-    if cached is not None:
-        return cached
+    with _LLM_CACHE_LOCK:
+        cached = _LLM_CACHE.get(key)
+        if cached is not None:
+            _LLM_CACHE.move_to_end(key)
+            return cached
 
+    # 构建放在锁外：ChatOpenAI 初始化可能触发 IO，不该阻塞其它线程读缓存
     if use_mock:
         client: Any = MockChatModel()
     else:
@@ -231,5 +251,14 @@ def get_llm(s: Optional["Settings"] = None) -> Any:
             api_key=cfg.openai_api_key,
             base_url=cfg.openai_base_url,
         )
-    _LLM_CACHE[key] = client
+
+    with _LLM_CACHE_LOCK:
+        # 并发下别的线程可能已建好同 key 客户端，复用它以免连接池翻倍
+        existing = _LLM_CACHE.get(key)
+        if existing is not None:
+            _LLM_CACHE.move_to_end(key)
+            return existing
+        _LLM_CACHE[key] = client
+        while len(_LLM_CACHE) > _LLM_CACHE_MAXSIZE:
+            _LLM_CACHE.popitem(last=False)
     return client

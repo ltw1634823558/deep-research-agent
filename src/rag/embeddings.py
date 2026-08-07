@@ -45,6 +45,24 @@ class Embedder:
             )
         return self._real
 
+    def close(self) -> None:
+        """释放底层 OpenAI 客户端持有的 httpx 连接池。
+
+        Embedder 随每个 ChromaRAGStore（即每轮 researcher）新建，只靠 GC 兜底会在
+        `embedding_provider=openai` 时造成连接池 churn / FD 堆积。
+        """
+        real, self._real = self._real, None
+        if real is None:
+            return
+        for attr in ("client", "async_client"):
+            inner = getattr(real, attr, None)
+            closer = getattr(getattr(inner, "_client", None), "close", None)
+            try:
+                if callable(closer):
+                    closer()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Embedder %s 关闭失败（已忽略）：%s", attr, exc)
+
     def embed(self, text: str) -> list[float]:
         if self.provider == "openai" and (self.api_key or self.base_url):
             try:

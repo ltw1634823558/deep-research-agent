@@ -20,7 +20,7 @@ from mcp.types import TextContent
 
 from mcp import ClientSession
 
-from ..config import settings
+from ..config import Settings, settings
 from ..state import Source
 
 # ExceptionGroup is a builtin only since Python 3.11. The project supports 3.10+,
@@ -49,8 +49,9 @@ def _default_command() -> list[str]:
     return [sys.executable, "-m", "src.mcp.server"]
 
 
-def _resolve_command() -> list[str]:
-    raw = (settings.mcp_server_command or "").strip()
+def _resolve_command(settings_obj: "Settings | None" = None) -> list[str]:
+    s = settings_obj or settings
+    raw = (s.mcp_server_command or "").strip()
     if not raw:
         return _default_command()
     parts = raw.split()
@@ -59,12 +60,23 @@ def _resolve_command() -> list[str]:
     return parts
 
 
-async def _call_tool(command: list[str], query: str, max_results: int) -> str:
+async def _call_tool(command: list[str], query: str, max_results: int, settings_obj: "Settings | None" = None) -> str:
+    s = settings_obj or settings
+    # 把 per-request 的 key 注入子进程环境，确保 MCP Server 侧按请求凭据生效（M-B）
+    mcp_env = {**os.environ}
+    if s.tavily_api_key:
+        mcp_env["TAVILY_API_KEY"] = s.tavily_api_key
+    else:
+        # 按请求「无 key」的租户不应继承进程级 TAVILY_API_KEY（L6）。
+        # 注意：这里必须置空而不能 pop —— MCP Server 子进程启动时会 load_dotenv()，
+        # 若变量缺失，.env 里的 key 会被重新注入；置空则因 override=False 而保留空值，
+        # 子进程稳定走 mock 分支，凭据隔离才真正成立。
+        mcp_env["TAVILY_API_KEY"] = ""
     params = StdioServerParameters(
         command=command[0],
         args=command[1:],
         cwd=str(PROJECT_ROOT),
-        env={**os.environ},
+        env=mcp_env,
     )
     async with stdio_client(params) as (read, write), ClientSession(read, write) as session:
         await session.initialize()
@@ -86,10 +98,31 @@ async def _call_tool(command: list[str], query: str, max_results: int) -> str:
         return ""
 
 
+# MCP 子进程调用整体超时：避免子进程挂起永久占住 job 线程（L-9）
+_MCP_JOIN_TIMEOUT = 30.0
+# 留给「取消协程 -> 关 stdin -> 终止子进程树」的清理时间；join 超时 = 上者 + 本值
+_JOIN_GRACE = 5.0
+
+
+async def _with_timeout(coro):
+    """协程级超时：取消会传播到 `stdio_client` 的 __aexit__，由它终止子进程。
+
+    这一层是超时的**主**防线。`_run_in_thread` 的 join 超时只是兜底——它无法
+    杀死已挂起的线程，只有协程被取消才能真正回收子进程与句柄。
+    """
+    try:
+        return await asyncio.wait_for(coro, timeout=_MCP_JOIN_TIMEOUT)
+    except asyncio.TimeoutError as exc:
+        raise RuntimeError(
+            f"MCP 检索调用超时（>{_MCP_JOIN_TIMEOUT}s），子进程已终止"
+        ) from exc
+
+
 def _run_in_thread(coro):
     """在独立后台线程里跑一个全新的事件循环，避免「已运行循环中再 asyncio.run」的 RuntimeError。
 
     仍保持每次调用启动子进程（subprocess-per-call）模型；不实现共享长连接会话。
+    带整体超时，防止 MCP 子进程挂起永久阻塞调用方线程。
     """
     result_holder: dict = {}
 
@@ -102,21 +135,31 @@ def _run_in_thread(coro):
         finally:
             loop.close()
 
-    thread = threading.Thread(target=_worker)
+    thread = threading.Thread(target=_worker, daemon=True)
     thread.start()
-    thread.join()
+    # join 必须比协程级超时更宽松，否则它总是先到期，_with_timeout 的优雅路径
+    # （取消 -> stdio_client 清理 -> 杀子进程）永远拿不到机会，worker 线程被白白遗弃。
+    thread.join(_MCP_JOIN_TIMEOUT + _JOIN_GRACE)
+    if thread.is_alive():
+        raise RuntimeError(f"MCP 检索调用超时（>{_MCP_JOIN_TIMEOUT}s），子进程可能已挂起")
     if "error" in result_holder:
         raise result_holder["error"]
     return result_holder["value"]
 
 
 def _run_coro(coro):
-    """循环安全执行协程：若已在事件循环中，则放到后台线程跑；否则用 asyncio.run。"""
+    """循环安全执行协程：若已在事件循环中，则放到后台线程跑；否则用 asyncio.run。
+
+    两条分支都必须包 `_with_timeout`。FastAPI 的同步端点与 `_run_job` 后台线程里
+    都**没有** running loop，走的正是 `asyncio.run` 分支；若只给线程分支加超时，
+    一次挂起的 MCP 子进程就能永久占住 job 线程，4 个并发即打满线程池导致全站饿死。
+    """
+    guarded = _with_timeout(coro)
     try:
         asyncio.get_running_loop()
     except RuntimeError:
-        return asyncio.run(coro)
-    return _run_in_thread(coro)
+        return asyncio.run(guarded)
+    return _run_in_thread(guarded)
 
 
 def _unwrap_runtime_error(exc: BaseException) -> BaseException:
@@ -138,11 +181,14 @@ def _root_cause_message(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}"
 
 
-def search_via_mcp(query: str, max_results: int = 5) -> list[Source]:
-    """经 MCP Server 检索，返回 Source 列表；失败直接抛异常，不再静默降级 mock。"""
-    command = _resolve_command()
+def search_via_mcp(query: str, max_results: int = 5, settings_obj: "Settings | None" = None) -> list[Source]:
+    """经 MCP Server 检索，返回 Source 列表；失败直接抛异常，不再静默降级 mock。
+
+    settings_obj 透传按请求配置，使 per-request mcp_server_command 真正生效。
+    """
+    command = _resolve_command(settings_obj)
     try:
-        raw = _run_coro(_call_tool(command, query, max_results))
+        raw = _run_coro(_call_tool(command, query, max_results, settings_obj))
         data = json.loads(raw)
         return [
             Source(

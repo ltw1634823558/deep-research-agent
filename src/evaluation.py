@@ -11,7 +11,10 @@
 
 from __future__ import annotations
 
+import logging
 import re
+
+logger = logging.getLogger(__name__)
 from dataclasses import asdict, dataclass, field
 
 from .observability import get_langfuse_client
@@ -33,7 +36,8 @@ class EvalResult:
         return asdict(self)
 
 
-def evaluate(state: ResearchState) -> EvalResult:
+def evaluate(state: ResearchState, cfg=None) -> EvalResult:
+    """计算三项质量指标；`cfg` 为按请求配置，用于把 score 写进该租户自己的 LangFuse 项目。"""
     report = (state.get("report") or "").strip()
     sources: list[Source] = state.get("sources") or []
     plan = state.get("plan") or []
@@ -78,21 +82,22 @@ def evaluate(state: ResearchState) -> EvalResult:
             "urls_in_report": len(urls_in_report),
         },
     )
-    _log_to_langfuse(result, state)
+    _log_to_langfuse(result, state, cfg)
     return result
 
 
-def _log_to_langfuse(result: EvalResult, state: ResearchState) -> None:
-    client = get_langfuse_client()
+def _log_to_langfuse(result: EvalResult, state: ResearchState, cfg=None) -> None:
+    client = get_langfuse_client(cfg)
     if client is None:
         return
     try:
-        trace = client.trace(
-            name="deep-research-eval",
-            metadata={"query": state.get("query"), "mode": state.get("mode")},
-        )
+        # langfuse v4：优先挂到当前进行中的 trace（与节点追踪串成同一条链路）；
+        # 无活跃 trace 时用 query 作 seed 生成确定性 trace id，避免分数挂到孤儿 trace（L2）。
+        trace_id = client.get_current_trace_id()
+        if not trace_id:
+            trace_id = client.create_trace_id(seed=state.get("query") or "eval")
         for name in ("task_completion_rate", "citation_accuracy", "hallucination_rate"):
-            client.score(trace_id=trace.id, name=name, value=getattr(result, name))
+            client.create_score(trace_id=trace_id, name=name, value=getattr(result, name))
         client.flush()
-    except Exception:
-        pass
+    except Exception as exc:  # 上报失败不应中断评估主流程
+        logger.debug("Langfuse 指标上报失败（已忽略）：%s", exc)
